@@ -36,6 +36,3 @@ object AddressExtractor {
         .replace(Regex("\\p{Mn}+"), "").replace(Regex("[^a-z0-9 ]"), " ")
         .replace(Regex("\\s+"), " ").trim()
 }
-
-
-==========================================================================================
