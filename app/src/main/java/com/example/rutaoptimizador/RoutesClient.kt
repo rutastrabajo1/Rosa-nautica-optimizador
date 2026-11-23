@@ -60,6 +60,3 @@ class RoutesClient(private val apiKey: String) {
     private fun location(p: Pair<Double, Double>) = JSONObject().put("latLng",
         JSONObject().put("latitude", p.first).put("longitude", p.second))
 }
-
-
-==========================================================================================
