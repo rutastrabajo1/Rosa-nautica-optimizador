@@ -11,6 +11,3 @@ interface StopDao {
     @Query("DELETE FROM stops WHERE id = :id") suspend fun delete(id: String)
     @Query("DELETE FROM stops") suspend fun clear()
 }
-
-
-==========================================================================================
