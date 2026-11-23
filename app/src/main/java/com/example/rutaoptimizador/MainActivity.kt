@@ -77,25 +77,74 @@ private fun RutaScreen(db: AppDatabase) {
                 permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
     }
 
-    val monterreyDefault = LatLng(25.6866, -100.3161)
+    val defaultCenter = LatLng(25.7815, -100.1886)
     val cameraPositionState = rememberCameraPositionState {
-        position = CameraPosition.fromLatLngZoom(monterreyDefault, 11.5f)
+        position = CameraPosition.fromLatLngZoom(defaultCenter, 12f)
+    }
+
+    // Extrae cualquier código postal mexicano de 5 dígitos (ej. 66603, 66645)
+    fun extractPostalCode(text: String): String? {
+        val cpRegex = Regex("""\b(\d{5})\b""")
+        return cpRegex.findAll(text)
+            .map { it.groupValues[1] }
+            .firstOrNull { it.toIntOrNull() in 1000..99999 }
     }
 
     suspend fun geocodeAddress(rawAddress: String): LatLng? = withContext(Dispatchers.IO) {
         try {
             val geocoder = Geocoder(context, Locale("es", "MX"))
-            val query = if (rawAddress.contains("Nuevo León", ignoreCase = true) ||
-                rawAddress.contains("Monterrey", ignoreCase = true) ||
-                rawAddress.contains("Apodaca", ignoreCase = true)
-            ) {
-                rawAddress
-            } else {
-                "$rawAddress, Nuevo León, México"
+            val postalCode = extractPostalCode(rawAddress)
+
+            // 1. Si trae código postal, obtenemos el centro exacto de ese CP para acotar la búsqueda a ~3 km
+            var cpCenter: LatLng? = null
+            if (postalCode != null) {
+                @Suppress("DEPRECATION")
+                val cpResults = geocoder.getFromLocationName("$postalCode, México", 1)
+                cpCenter = cpResults?.firstOrNull()?.let { LatLng(it.latitude, it.longitude) }
             }
+
+            // 2. Construimos la consulta incluyendo explícitamente el CP si existe
+            val query = when {
+                postalCode != null && !rawAddress.contains("México", ignoreCase = true) ->
+                    "$rawAddress, CP $postalCode, México"
+                rawAddress.contains("Nuevo León", ignoreCase = true) ||
+                        rawAddress.contains("México", ignoreCase = true) ->
+                    rawAddress
+                else ->
+                    "$rawAddress, Nuevo León, México"
+            }
+
+            // 3. Definimos la caja geográfica (bounding box):
+            //    - Si hay centro de CP: radio estrecho de ~0.035 grados (~3.5 km) alrededor del CP
+            //    - Si no hay CP: área metropolitana general
+            val lowerLeftLat = cpCenter?.let { it.latitude - 0.035 } ?: 25.55
+            val lowerLeftLng = cpCenter?.let { it.longitude - 0.035 } ?: -100.48
+            val upperRightLat = cpCenter?.let { it.latitude + 0.035 } ?: 25.92
+            val upperRightLng = cpCenter?.let { it.longitude + 0.035 } ?: -100.05
+
             @Suppress("DEPRECATION")
-            val results = geocoder.getFromLocationName(query, 1)
-            results?.firstOrNull()?.let { LatLng(it.latitude, it.longitude) }
+            val results = geocoder.getFromLocationName(
+                query,
+                5,
+                lowerLeftLat,
+                lowerLeftLng,
+                upperRightLat,
+                upperRightLng
+            )
+
+            // 4. Priorizar el resultado que coincida exactamente con el código postal y caiga dentro del límite
+            val bestMatch = results?.firstOrNull { addr ->
+                val matchesCp = postalCode == null || addr.postalCode == postalCode
+                val inBounds = addr.latitude in lowerLeftLat..upperRightLat &&
+                        addr.longitude in lowerLeftLng..upperRightLng
+                matchesCp && inBounds
+            } ?: results?.firstOrNull { addr ->
+                addr.latitude in lowerLeftLat..upperRightLat &&
+                        addr.longitude in lowerLeftLng..upperRightLng
+            }
+
+            // Si la calle exacta no arroja pin pero sí tenemos el centro del CP, usamos el centro del CP como respaldo
+            bestMatch?.let { LatLng(it.latitude, it.longitude) } ?: cpCenter
         } catch (_: Exception) {
             null
         }
@@ -107,7 +156,10 @@ private fun RutaScreen(db: AppDatabase) {
                 busy = true
                 var processed = 0
                 var candidates = 0
+                var emptyPhotos = 0
                 val ocr = OcrProcessor()
+
+                // Procesamiento sin límite de imágenes (1 hasta N fotos)
                 uris.forEachIndexed { index, uri ->
                     status = "Procesando fotografía ${index + 1} de ${uris.size}…"
                     try {
@@ -123,14 +175,16 @@ private fun RutaScreen(db: AppDatabase) {
                         if (found.isNotEmpty()) {
                             db.stopDao().upsertAll(found)
                             candidates += found.size
+                        } else {
+                            emptyPhotos++
                         }
                     } catch (_: Exception) {
-                        // La fotografía fallida no detiene el resto.
+                        emptyPhotos++
                     }
                     processed++
                 }
                 busy = false
-                status = "Procesadas $processed fotografías. $candidates candidatos agregados para revisión."
+                status = "Procesadas $processed fotos ($emptyPhotos sin lectura). $candidates domicilios agregados."
             }
         }
     }
@@ -149,26 +203,72 @@ private fun RutaScreen(db: AppDatabase) {
         ) {
             Text(status, style = MaterialTheme.typography.bodyMedium)
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 Button(
                     onClick = { picker.launch("image/*") },
-                    enabled = !busy
+                    enabled = !busy,
+                    modifier = Modifier.weight(1f)
                 ) {
-                    Text("Agregar fotografías")
+                    Text("Agregar fotos")
                 }
 
-                OutlinedButton(onClick = {
-                    if (!showMap && !hasLocationPermission) {
-                        permissionLauncher.launch(
-                            arrayOf(
-                                Manifest.permission.ACCESS_FINE_LOCATION,
-                                Manifest.permission.ACCESS_COARSE_LOCATION
+                OutlinedButton(
+                    onClick = {
+                        if (!showMap && !hasLocationPermission) {
+                            permissionLauncher.launch(
+                                arrayOf(
+                                    Manifest.permission.ACCESS_FINE_LOCATION,
+                                    Manifest.permission.ACCESS_COARSE_LOCATION
+                                )
                             )
-                        )
+                        }
+                        showMap = !showMap
                     }
-                    showMap = !showMap
-                }) {
+                ) {
                     Text(if (showMap) "Ver Lista" else "Ver Mapa")
+                }
+            }
+
+            // Botón de Optimizar Ruta visible en cuanto haya 2 o más entregas ubicadas
+            val markers: List<Stop> = stops.filter { it.latitude != null && it.longitude != null }
+            if (markers.size >= 2) {
+                Button(
+                    onClick = {
+                        scope.launch {
+                            busy = true
+                            status = "Optimizando orden de ${markers.size} paradas…"
+                            val remaining = markers.toMutableList()
+                            val ordered = mutableListOf<Stop>()
+                            var current = remaining.removeAt(0)
+                            ordered.add(current)
+
+                            while (remaining.isNotEmpty()) {
+                                val nextIndex = remaining.indices.minByOrNull { i ->
+                                    val target = remaining[i]
+                                    val dLat = (target.latitude ?: 0.0) - (current.latitude ?: 0.0)
+                                    val dLng = (target.longitude ?: 0.0) - (current.longitude ?: 0.0)
+                                    dLat * dLat + dLng * dLng
+                                } ?: 0
+                                current = remaining.removeAt(nextIndex)
+                                ordered.add(current)
+                            }
+
+                            db.stopDao().upsertAll(ordered)
+                            showMap = true
+                            busy = false
+                            status = "Ruta optimizada con ${ordered.size} paradas en orden."
+                        }
+                    },
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.secondary
+                    )
+                ) {
+                    Text("Optimizar Ruta (${markers.size} paradas)")
                 }
             }
 
@@ -217,7 +317,6 @@ private fun RutaScreen(db: AppDatabase) {
                 }
             }
 
-            val markers: List<Stop> = stops.filter { it.latitude != null && it.longitude != null }
             Text(
                 "Entregas: ${stops.size} · En mapa: ${markers.size} · Pendientes: ${stops.count { !it.verified }}",
                 style = MaterialTheme.typography.bodySmall
