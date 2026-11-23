@@ -1,5 +1,4 @@
 import java.util.Properties
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -50,6 +49,3 @@ dependencies {
     implementation("org.json:json:20240303")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
-
-
-==========================================================================================
