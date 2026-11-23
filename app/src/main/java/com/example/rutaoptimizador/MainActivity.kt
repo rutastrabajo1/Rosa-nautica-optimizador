@@ -472,4 +472,52 @@ private fun RutaScreen(db: AppDatabase) {
                                 Text("$badge · ${stop.address}", style = MaterialTheme.typography.titleSmall)
                                 Text(
                                     text = "${stop.source} · ${if (stop.verified) "Verificado" else "Pendiente"} · ${if (hasCoords) "Ubicado en mapa" else "Sin GPS"}",
-          
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                                Row {
+                                    TextButton(onClick = {
+                                        val nextType = when (stop.type) {
+                                            "ENTREGA" -> "COBRO"
+                                            "COBRO" -> "RECOLECCION"
+                                            else -> "ENTREGA"
+                                        }
+                                        scope.launch { db.stopDao().upsert(stop.copy(type = nextType)) }
+                                    }) {
+                                        Text("Cambiar tipo")
+                                    }
+                                    if (!stop.verified) {
+                                        TextButton(onClick = {
+                                            scope.launch { db.stopDao().upsert(stop.copy(verified = true)) }
+                                        }) {
+                                            Text("Confirmar")
+                                        }
+                                    }
+                                    if (hasCoords && lat != null && lng != null) {
+                                        TextButton(onClick = {
+                                            showMap = true
+                                            scope.launch {
+                                                cameraPositionState.animate(
+                                                    CameraUpdateFactory.newLatLngZoom(
+                                                        LatLng(lat, lng),
+                                                        16f
+                                                    )
+                                                )
+                                            }
+                                        }) {
+                                            Text("Ver en mapa")
+                                        }
+                                    }
+                                    TextButton(onClick = {
+                                        scope.launch { db.stopDao().delete(stop.id) }
+                                    }) {
+                                        Text("Eliminar")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
