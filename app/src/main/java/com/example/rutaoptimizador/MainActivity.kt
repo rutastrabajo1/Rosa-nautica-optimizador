@@ -19,7 +19,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.room.Room
-import com.google.android.gms.location.LocationServices
 import com.google.android.gms.maps.CameraUpdateFactory
 import com.google.android.gms.maps.model.BitmapDescriptorFactory
 import com.google.android.gms.maps.model.CameraPosition
@@ -62,7 +61,6 @@ private fun RutaScreen(db: AppDatabase) {
     var manualAddress by remember { mutableStateOf("") }
     var showMap by remember { mutableStateOf(false) }
 
-    // Estado de permisos de ubicación GPS
     var hasLocationPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(
@@ -79,13 +77,11 @@ private fun RutaScreen(db: AppDatabase) {
                 permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
     }
 
-    // Cámara centrada por defecto en Monterrey, Nuevo León
     val monterreyDefault = LatLng(25.6866, -100.3161)
     val cameraPositionState = rememberCameraPositionState {
         position = CameraPosition.fromLatLngZoom(monterreyDefault, 11.5f)
     }
 
-    // Función auxiliar para obtener coordenadas desde una dirección
     suspend fun geocodeAddress(rawAddress: String): LatLng? = withContext(Dispatchers.IO) {
         try {
             val geocoder = Geocoder(context, Locale("es", "MX"))
@@ -221,46 +217,45 @@ private fun RutaScreen(db: AppDatabase) {
                 }
             }
 
-            val markers = stops.filter { it.latitude != null && it.longitude != null }
+            val markers: List<Stop> = stops.filter { it.latitude != null && it.longitude != null }
             Text(
                 "Entregas: ${stops.size} · En mapa: ${markers.size} · Pendientes: ${stops.count { !it.verified }}",
                 style = MaterialTheme.typography.bodySmall
             )
 
             if (showMap) {
-                // Centra la cámara en el primer pin disponible si existe
                 LaunchedEffect(markers) {
-                    markers.firstOrNull()?.let { first ->
+                    val first = markers.firstOrNull()
+                    val lat = first?.latitude
+                    val lng = first?.longitude
+                    if (lat != null && lng != null) {
                         cameraPositionState.animate(
-                            CameraUpdateFactory.newLatLngZoom(
-                                LatLng(first.latitude!!, first.longitude!!),
-                                13f
-                            )
+                            CameraUpdateFactory.newLatLngZoom(LatLng(lat, lng), 13f)
                         )
                     }
                 }
 
-                Box(
+                GoogleMap(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .weight(1f)
+                        .weight(1f),
+                    cameraPositionState = cameraPositionState,
+                    properties = MapProperties(
+                        isMyLocationEnabled = hasLocationPermission
+                    ),
+                    uiSettings = MapUiSettings(
+                        myLocationButtonEnabled = hasLocationPermission,
+                        zoomControlsEnabled = true,
+                        compassEnabled = true
+                    )
                 ) {
-                    GoogleMap(
-                        modifier = Modifier.fillMaxSize(),
-                        cameraPositionState = cameraPositionState,
-                        properties = MapProperties(
-                            isMyLocationEnabled = hasLocationPermission
-                        ),
-                        uiSettings = MapUiSettings(
-                            myLocationButtonEnabled = true,
-                            zoomControlsEnabled = true,
-                            compassEnabled = true
-                        )
-                    ) {
-                        markers.forEachIndexed { index, stop ->
+                    markers.forEachIndexed { index, stop ->
+                        val lat = stop.latitude
+                        val lng = stop.longitude
+                        if (lat != null && lng != null) {
                             Marker(
                                 state = rememberUpdatedMarkerState(
-                                    position = LatLng(stop.latitude!!, stop.longitude!!)
+                                    position = LatLng(lat, lng)
                                 ),
                                 title = "Parada #${index + 1}",
                                 snippet = stop.address,
@@ -271,30 +266,6 @@ private fun RutaScreen(db: AppDatabase) {
                             )
                         }
                     }
-
-                    // Botón rápido para centrar en el GPS actual si ya hay permiso
-                    if (hasLocationPermission) {
-                        SmallFloatingActionButton(
-                            onClick = {
-                                val fusedLocation = LocationServices.getFusedLocationProviderClient(context)
-                                fusedLocation.lastLocation.addOnSuccessListener { location ->
-                                    location?.let {
-                                        scope.launch {
-                                            cameraPositionState.animate(
-                                                CameraUpdateFactory.newLatLngZoom(
-                                                    LatLng(it.latitude, it.longitude),
-                                                    15f
-                                                )
-                                            )
-                                        }
-                                    }
-                                }
-                            },
-                            modifier = Modifier.padding(12.dp)
-                        ) {
-                            Text("Mi GPS", modifier = Modifier.padding(horizontal = 8.dp))
-                        }
-                    }
                 }
             } else {
                 LazyColumn(
@@ -302,7 +273,9 @@ private fun RutaScreen(db: AppDatabase) {
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     items(stops, key = { it.id }) { stop ->
-                        val hasCoords = stop.latitude != null && stop.longitude != null
+                        val lat = stop.latitude
+                        val lng = stop.longitude
+                        val hasCoords = lat != null && lng != null
                         Card(Modifier.fillMaxWidth()) {
                             Column(Modifier.padding(10.dp)) {
                                 Text(stop.address, style = MaterialTheme.typography.titleSmall)
@@ -318,13 +291,13 @@ private fun RutaScreen(db: AppDatabase) {
                                             Text("Confirmar")
                                         }
                                     }
-                                    if (hasCoords) {
+                                    if (hasCoords && lat != null && lng != null) {
                                         TextButton(onClick = {
                                             showMap = true
                                             scope.launch {
                                                 cameraPositionState.animate(
                                                     CameraUpdateFactory.newLatLngZoom(
-                                                        LatLng(stop.latitude!!, stop.longitude!!),
+                                                        LatLng(lat, lng),
                                                         16f
                                                     )
                                                 )
