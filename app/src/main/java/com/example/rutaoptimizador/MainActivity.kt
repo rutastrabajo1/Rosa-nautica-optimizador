@@ -3,6 +3,11 @@ package com.example.rutaoptimizador
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
 import android.location.Geocoder
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -20,6 +25,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.room.Room
 import com.google.android.gms.maps.CameraUpdateFactory
+import com.google.android.gms.maps.model.BitmapDescriptor
 import com.google.android.gms.maps.model.BitmapDescriptorFactory
 import com.google.android.gms.maps.model.CameraPosition
 import com.google.android.gms.maps.model.LatLng
@@ -39,7 +45,9 @@ class MainActivity : ComponentActivity() {
             applicationContext,
             AppDatabase::class.java,
             "ruta-optimizador.db"
-        ).build()
+        )
+            .fallbackToDestructiveMigration()
+            .build()
 
         setContent {
             MaterialTheme {
@@ -47,6 +55,71 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+}
+
+private fun createStopMarkerIcon(type: String): BitmapDescriptor {
+    val size = 84
+    val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(bitmap)
+    val center = size / 2f
+
+    when (type) {
+        "RECOLECCION" -> {
+            val boxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#D97706")
+                style = Paint.Style.FILL
+            }
+            val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.STROKE
+                strokeWidth = 5f
+            }
+            val tapePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#FEF3C7")
+                style = Paint.Style.FILL
+            }
+            val rect = RectF(14f, 18f, size - 14f, size - 14f)
+            canvas.drawRoundRect(rect, 10f, 10f, boxPaint)
+            canvas.drawRoundRect(rect, 10f, 10f, borderPaint)
+            canvas.drawRect(center - 6f, 18f, center + 6f, 38f, tapePaint)
+        }
+        "COBRO" -> {
+            val circlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#16A34A")
+                style = Paint.Style.FILL
+            }
+            val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.STROKE
+                strokeWidth = 5f
+            }
+            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                textSize = 42f
+                textAlign = Paint.Align.CENTER
+                isFakeBoldText = true
+            }
+            canvas.drawCircle(center, center, 32f, circlePaint)
+            canvas.drawCircle(center, center, 32f, borderPaint)
+            val textY = center - (textPaint.descent() + textPaint.ascent()) / 2f
+            canvas.drawText("$", center, textY, textPaint)
+        }
+        else -> {
+            val circlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#22C55E")
+                style = Paint.Style.FILL
+            }
+            val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.STROKE
+                strokeWidth = 5f
+            }
+            canvas.drawCircle(center, center, 28f, circlePaint)
+            canvas.drawCircle(center, center, 28f, borderPaint)
+        }
+    }
+
+    return BitmapDescriptorFactory.fromBitmap(bitmap)
 }
 
 @SuppressLint("MissingPermission")
@@ -59,6 +132,7 @@ private fun RutaScreen(db: AppDatabase) {
     var status by remember { mutableStateOf("Selecciona fotografías para reconocer domicilios.") }
     var busy by remember { mutableStateOf(false) }
     var manualAddress by remember { mutableStateOf("") }
+    var manualType by remember { mutableStateOf("ENTREGA") }
     var showMap by remember { mutableStateOf(false) }
 
     var hasLocationPermission by remember {
@@ -82,7 +156,6 @@ private fun RutaScreen(db: AppDatabase) {
         position = CameraPosition.fromLatLngZoom(defaultCenter, 12f)
     }
 
-    // Extrae cualquier código postal mexicano de 5 dígitos (ej. 66603, 66645)
     fun extractPostalCode(text: String): String? {
         val cpRegex = Regex("""\b(\d{5})\b""")
         return cpRegex.findAll(text)
@@ -95,7 +168,6 @@ private fun RutaScreen(db: AppDatabase) {
             val geocoder = Geocoder(context, Locale("es", "MX"))
             val postalCode = extractPostalCode(rawAddress)
 
-            // 1. Si trae código postal, obtenemos el centro exacto de ese CP para acotar la búsqueda a ~3 km
             var cpCenter: LatLng? = null
             if (postalCode != null) {
                 @Suppress("DEPRECATION")
@@ -103,7 +175,6 @@ private fun RutaScreen(db: AppDatabase) {
                 cpCenter = cpResults?.firstOrNull()?.let { LatLng(it.latitude, it.longitude) }
             }
 
-            // 2. Construimos la consulta incluyendo explícitamente el CP si existe
             val query = when {
                 postalCode != null && !rawAddress.contains("México", ignoreCase = true) ->
                     "$rawAddress, CP $postalCode, México"
@@ -114,9 +185,6 @@ private fun RutaScreen(db: AppDatabase) {
                     "$rawAddress, Nuevo León, México"
             }
 
-            // 3. Definimos la caja geográfica (bounding box):
-            //    - Si hay centro de CP: radio estrecho de ~0.035 grados (~3.5 km) alrededor del CP
-            //    - Si no hay CP: área metropolitana general
             val lowerLeftLat = cpCenter?.let { it.latitude - 0.035 } ?: 25.55
             val lowerLeftLng = cpCenter?.let { it.longitude - 0.035 } ?: -100.48
             val upperRightLat = cpCenter?.let { it.latitude + 0.035 } ?: 25.92
@@ -132,7 +200,6 @@ private fun RutaScreen(db: AppDatabase) {
                 upperRightLng
             )
 
-            // 4. Priorizar el resultado que coincida exactamente con el código postal y caiga dentro del límite
             val bestMatch = results?.firstOrNull { addr ->
                 val matchesCp = postalCode == null || addr.postalCode == postalCode
                 val inBounds = addr.latitude in lowerLeftLat..upperRightLat &&
@@ -143,7 +210,6 @@ private fun RutaScreen(db: AppDatabase) {
                         addr.longitude in lowerLeftLng..upperRightLng
             }
 
-            // Si la calle exacta no arroja pin pero sí tenemos el centro del CP, usamos el centro del CP como respaldo
             bestMatch?.let { LatLng(it.latitude, it.longitude) } ?: cpCenter
         } catch (_: Exception) {
             null
@@ -159,18 +225,17 @@ private fun RutaScreen(db: AppDatabase) {
                 var emptyPhotos = 0
                 val ocr = OcrProcessor()
 
-                // Procesamiento sin límite de imágenes (1 hasta N fotos)
                 uris.forEachIndexed { index, uri ->
                     status = "Procesando fotografía ${index + 1} de ${uris.size}…"
                     try {
                         val text = withContext(Dispatchers.IO) { ocr.read(context, uri) }
-                        val found = AddressExtractor.candidates(text).map { stop ->
+                        val found = AddressExtractor.candidates(text).mapIndexed { idx, stop ->
                             val coords = geocodeAddress(stop.address)
-                            if (coords != null) {
-                                stop.copy(latitude = coords.latitude, longitude = coords.longitude)
-                            } else {
-                                stop
-                            }
+                            stop.copy(
+                                latitude = coords?.latitude,
+                                longitude = coords?.longitude,
+                                orderIndex = candidates + idx
+                            )
                         }
                         if (found.isNotEmpty()) {
                             db.stopDao().upsertAll(found)
@@ -232,7 +297,6 @@ private fun RutaScreen(db: AppDatabase) {
                 }
             }
 
-            // Botón de Optimizar Ruta visible en cuanto haya 2 o más entregas ubicadas
             val markers: List<Stop> = stops.filter { it.latitude != null && it.longitude != null }
             if (markers.size >= 2) {
                 Button(
@@ -243,8 +307,9 @@ private fun RutaScreen(db: AppDatabase) {
                             val remaining = markers.toMutableList()
                             val ordered = mutableListOf<Stop>()
                             var current = remaining.removeAt(0)
-                            ordered.add(current)
+                            ordered.add(current.copy(orderIndex = 0))
 
+                            var step = 1
                             while (remaining.isNotEmpty()) {
                                 val nextIndex = remaining.indices.minByOrNull { i ->
                                     val target = remaining[i]
@@ -253,7 +318,7 @@ private fun RutaScreen(db: AppDatabase) {
                                     dLat * dLat + dLng * dLng
                                 } ?: 0
                                 current = remaining.removeAt(nextIndex)
-                                ordered.add(current)
+                                ordered.add(current.copy(orderIndex = step++))
                             }
 
                             db.stopDao().upsertAll(ordered)
@@ -280,11 +345,29 @@ private fun RutaScreen(db: AppDatabase) {
                     label = { Text("Agregar domicilio") },
                     singleLine = true
                 )
+                OutlinedButton(
+                    onClick = {
+                        manualType = when (manualType) {
+                            "ENTREGA" -> "COBRO"
+                            "COBRO" -> "RECOLECCION"
+                            else -> "ENTREGA"
+                        }
+                    }
+                ) {
+                    Text(
+                        when (manualType) {
+                            "COBRO" -> "🟢$ Cobro"
+                            "RECOLECCION" -> "📦 Recol."
+                            else -> "🟢 Entrega"
+                        }
+                    )
+                }
                 Button(
                     enabled = !busy,
                     onClick = {
                         if (manualAddress.isNotBlank()) {
                             val cleanAddress = manualAddress.trim()
+                            val selectedType = manualType
                             manualAddress = ""
                             scope.launch {
                                 busy = true
@@ -297,7 +380,9 @@ private fun RutaScreen(db: AppDatabase) {
                                         latitude = coords?.latitude,
                                         longitude = coords?.longitude,
                                         source = "Manual",
-                                        verified = true
+                                        verified = true,
+                                        orderIndex = stops.size,
+                                        type = selectedType
                                     )
                                 )
                                 if (coords != null) {
@@ -318,7 +403,7 @@ private fun RutaScreen(db: AppDatabase) {
             }
 
             Text(
-                "Entregas: ${stops.size} · En mapa: ${markers.size} · Pendientes: ${stops.count { !it.verified }}",
+                "Entregas: ${stops.size} · En mapa: ${markers.size} · 🟢 ${stops.count { it.type == "ENTREGA" }} · 🟢$ ${stops.count { it.type == "COBRO" }} · 📦 ${stops.count { it.type == "RECOLECCION" }}",
                 style = MaterialTheme.typography.bodySmall
             )
 
@@ -352,16 +437,18 @@ private fun RutaScreen(db: AppDatabase) {
                         val lat = stop.latitude
                         val lng = stop.longitude
                         if (lat != null && lng != null) {
+                            val typeLabel = when (stop.type) {
+                                "COBRO" -> "Entrega con cobro ($)"
+                                "RECOLECCION" -> "Recolección"
+                                else -> "Entrega"
+                            }
                             Marker(
                                 state = rememberUpdatedMarkerState(
                                     position = LatLng(lat, lng)
                                 ),
-                                title = "Parada #${index + 1}",
+                                title = "Parada #${index + 1} · $typeLabel",
                                 snippet = stop.address,
-                                icon = BitmapDescriptorFactory.defaultMarker(
-                                    if (stop.verified) BitmapDescriptorFactory.HUE_AZURE
-                                    else BitmapDescriptorFactory.HUE_ORANGE
-                                )
+                                icon = createStopMarkerIcon(stop.type)
                             )
                         }
                     }
@@ -375,47 +462,14 @@ private fun RutaScreen(db: AppDatabase) {
                         val lat = stop.latitude
                         val lng = stop.longitude
                         val hasCoords = lat != null && lng != null
+                        val badge = when (stop.type) {
+                            "COBRO" -> "🟢$ Entrega con cobro"
+                            "RECOLECCION" -> "📦 Recolección"
+                            else -> "🟢 Entrega"
+                        }
                         Card(Modifier.fillMaxWidth()) {
                             Column(Modifier.padding(10.dp)) {
-                                Text(stop.address, style = MaterialTheme.typography.titleSmall)
+                                Text("$badge · ${stop.address}", style = MaterialTheme.typography.titleSmall)
                                 Text(
                                     text = "${stop.source} · ${if (stop.verified) "Verificado" else "Pendiente"} · ${if (hasCoords) "Ubicado en mapa" else "Sin GPS"}",
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                                Row {
-                                    if (!stop.verified) {
-                                        TextButton(onClick = {
-                                            scope.launch { db.stopDao().upsert(stop.copy(verified = true)) }
-                                        }) {
-                                            Text("Confirmar")
-                                        }
-                                    }
-                                    if (hasCoords && lat != null && lng != null) {
-                                        TextButton(onClick = {
-                                            showMap = true
-                                            scope.launch {
-                                                cameraPositionState.animate(
-                                                    CameraUpdateFactory.newLatLngZoom(
-                                                        LatLng(lat, lng),
-                                                        16f
-                                                    )
-                                                )
-                                            }
-                                        }) {
-                                            Text("Ver en mapa")
-                                        }
-                                    }
-                                    TextButton(onClick = {
-                                        scope.launch { db.stopDao().delete(stop.id) }
-                                    }) {
-                                        Text("Eliminar")
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
+          
