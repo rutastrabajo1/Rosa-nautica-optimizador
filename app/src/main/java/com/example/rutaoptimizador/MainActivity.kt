@@ -1,5 +1,9 @@
 package com.example.rutaoptimizador
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.pm.PackageManager
+import android.location.Geocoder
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -13,12 +17,18 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.room.Room
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.maps.CameraUpdateFactory
+import com.google.android.gms.maps.model.BitmapDescriptorFactory
+import com.google.android.gms.maps.model.CameraPosition
 import com.google.android.gms.maps.model.LatLng
 import com.google.maps.android.compose.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Locale
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
@@ -40,6 +50,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@SuppressLint("MissingPermission")
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun RutaScreen(db: AppDatabase) {
@@ -50,6 +61,49 @@ private fun RutaScreen(db: AppDatabase) {
     var busy by remember { mutableStateOf(false) }
     var manualAddress by remember { mutableStateOf("") }
     var showMap by remember { mutableStateOf(false) }
+
+    // Estado de permisos de ubicación GPS
+    var hasLocationPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        hasLocationPermission = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+    }
+
+    // Cámara centrada por defecto en Monterrey, Nuevo León
+    val monterreyDefault = LatLng(25.6866, -100.3161)
+    val cameraPositionState = rememberCameraPositionState {
+        position = CameraPosition.fromLatLngZoom(monterreyDefault, 11.5f)
+    }
+
+    // Función auxiliar para obtener coordenadas desde una dirección
+    suspend fun geocodeAddress(rawAddress: String): LatLng? = withContext(Dispatchers.IO) {
+        try {
+            val geocoder = Geocoder(context, Locale("es", "MX"))
+            val query = if (rawAddress.contains("Nuevo León", ignoreCase = true) ||
+                rawAddress.contains("Monterrey", ignoreCase = true) ||
+                rawAddress.contains("Apodaca", ignoreCase = true)
+            ) {
+                rawAddress
+            } else {
+                "$rawAddress, Nuevo León, México"
+            }
+            @Suppress("DEPRECATION")
+            val results = geocoder.getFromLocationName(query, 1)
+            results?.firstOrNull()?.let { LatLng(it.latitude, it.longitude) }
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
         if (uris.isNotEmpty()) {
@@ -62,13 +116,20 @@ private fun RutaScreen(db: AppDatabase) {
                     status = "Procesando fotografía ${index + 1} de ${uris.size}…"
                     try {
                         val text = withContext(Dispatchers.IO) { ocr.read(context, uri) }
-                        val found = AddressExtractor.candidates(text)
+                        val found = AddressExtractor.candidates(text).map { stop ->
+                            val coords = geocodeAddress(stop.address)
+                            if (coords != null) {
+                                stop.copy(latitude = coords.latitude, longitude = coords.longitude)
+                            } else {
+                                stop
+                            }
+                        }
                         if (found.isNotEmpty()) {
                             db.stopDao().upsertAll(found)
                             candidates += found.size
                         }
                     } catch (_: Exception) {
-                        // La fotografía fallida no detiene el resto; se refleja en el estado final.
+                        // La fotografía fallida no detiene el resto.
                     }
                     processed++
                 }
@@ -91,6 +152,7 @@ private fun RutaScreen(db: AppDatabase) {
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Text(status, style = MaterialTheme.typography.bodyMedium)
+
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
                     onClick = { picker.launch("image/*") },
@@ -98,50 +160,140 @@ private fun RutaScreen(db: AppDatabase) {
                 ) {
                     Text("Agregar fotografías")
                 }
-                OutlinedButton(onClick = { showMap = !showMap }) {
-                    Text(if (showMap) "Lista" else "Mapa")
+
+                OutlinedButton(onClick = {
+                    if (!showMap && !hasLocationPermission) {
+                        permissionLauncher.launch(
+                            arrayOf(
+                                Manifest.permission.ACCESS_FINE_LOCATION,
+                                Manifest.permission.ACCESS_COARSE_LOCATION
+                            )
+                        )
+                    }
+                    showMap = !showMap
+                }) {
+                    Text(if (showMap) "Ver Lista" else "Ver Mapa")
                 }
             }
+
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
                     value = manualAddress,
                     onValueChange = { manualAddress = it },
                     modifier = Modifier.weight(1f),
-                    label = { Text("Agregar domicilio") }
+                    label = { Text("Agregar domicilio") },
+                    singleLine = true
                 )
-                Button(onClick = {
-                    if (manualAddress.isNotBlank()) {
-                        scope.launch {
-                            db.stopDao().upsert(
-                                Stop(
-                                    id = UUID.randomUUID().toString(),
-                                    address = manualAddress.trim(),
-                                    source = "Manual",
-                                    verified = true
-                                )
-                            )
+                Button(
+                    enabled = !busy,
+                    onClick = {
+                        if (manualAddress.isNotBlank()) {
+                            val cleanAddress = manualAddress.trim()
                             manualAddress = ""
+                            scope.launch {
+                                busy = true
+                                status = "Ubicando domicilio en el mapa…"
+                                val coords = geocodeAddress(cleanAddress)
+                                db.stopDao().upsert(
+                                    Stop(
+                                        id = UUID.randomUUID().toString(),
+                                        address = cleanAddress,
+                                        latitude = coords?.latitude,
+                                        longitude = coords?.longitude,
+                                        source = "Manual",
+                                        verified = true
+                                    )
+                                )
+                                if (coords != null) {
+                                    cameraPositionState.animate(
+                                        CameraUpdateFactory.newLatLngZoom(coords, 15f)
+                                    )
+                                    status = "Domicilio agregado y ubicado en el mapa."
+                                } else {
+                                    status = "Domicilio agregado (sin coordenadas exactas)."
+                                }
+                                busy = false
+                            }
                         }
                     }
-                }) {
+                ) {
                     Text("Añadir")
                 }
             }
-            Text("Entregas: ${stops.size} · pendientes de revisión: ${stops.count { !it.verified }}")
+
+            val markers = stops.filter { it.latitude != null && it.longitude != null }
+            Text(
+                "Entregas: ${stops.size} · En mapa: ${markers.size} · Pendientes: ${stops.count { !it.verified }}",
+                style = MaterialTheme.typography.bodySmall
+            )
+
             if (showMap) {
-                val markers = stops.filter { it.latitude != null && it.longitude != null }
-                GoogleMap(
+                // Centra la cámara en el primer pin disponible si existe
+                LaunchedEffect(markers) {
+                    markers.firstOrNull()?.let { first ->
+                        cameraPositionState.animate(
+                            CameraUpdateFactory.newLatLngZoom(
+                                LatLng(first.latitude!!, first.longitude!!),
+                                13f
+                            )
+                        )
+                    }
+                }
+
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
                 ) {
-                    markers.forEach { stop ->
-                        Marker(
-                            state = rememberUpdatedMarkerState(
-                                position = LatLng(stop.latitude!!, stop.longitude!!)
-                            ),
-                            title = stop.address
+                    GoogleMap(
+                        modifier = Modifier.fillMaxSize(),
+                        cameraPositionState = cameraPositionState,
+                        properties = MapProperties(
+                            isMyLocationEnabled = hasLocationPermission
+                        ),
+                        uiSettings = MapUiSettings(
+                            myLocationButtonEnabled = true,
+                            zoomControlsEnabled = true,
+                            compassEnabled = true
                         )
+                    ) {
+                        markers.forEachIndexed { index, stop ->
+                            Marker(
+                                state = rememberUpdatedMarkerState(
+                                    position = LatLng(stop.latitude!!, stop.longitude!!)
+                                ),
+                                title = "Parada #${index + 1}",
+                                snippet = stop.address,
+                                icon = BitmapDescriptorFactory.defaultMarker(
+                                    if (stop.verified) BitmapDescriptorFactory.HUE_AZURE
+                                    else BitmapDescriptorFactory.HUE_ORANGE
+                                )
+                            )
+                        }
+                    }
+
+                    // Botón rápido para centrar en el GPS actual si ya hay permiso
+                    if (hasLocationPermission) {
+                        SmallFloatingActionButton(
+                            onClick = {
+                                val fusedLocation = LocationServices.getFusedLocationProviderClient(context)
+                                fusedLocation.lastLocation.addOnSuccessListener { location ->
+                                    location?.let {
+                                        scope.launch {
+                                            cameraPositionState.animate(
+                                                CameraUpdateFactory.newLatLngZoom(
+                                                    LatLng(it.latitude, it.longitude),
+                                                    15f
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+                            },
+                            modifier = Modifier.padding(12.dp)
+                        ) {
+                            Text("Mi GPS", modifier = Modifier.padding(horizontal = 8.dp))
+                        }
                     }
                 }
             } else {
@@ -150,18 +302,36 @@ private fun RutaScreen(db: AppDatabase) {
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     items(stops, key = { it.id }) { stop ->
+                        val hasCoords = stop.latitude != null && stop.longitude != null
                         Card(Modifier.fillMaxWidth()) {
                             Column(Modifier.padding(10.dp)) {
-                                Text(stop.address)
+                                Text(stop.address, style = MaterialTheme.typography.titleSmall)
                                 Text(
-                                    text = "${stop.source} · ${if (stop.verified) "Verificado" else "Pendiente de revisión"}",
+                                    text = "${stop.source} · ${if (stop.verified) "Verificado" else "Pendiente"} · ${if (hasCoords) "Ubicado en mapa" else "Sin GPS"}",
                                     style = MaterialTheme.typography.bodySmall
                                 )
                                 Row {
-                                    TextButton(onClick = {
-                                        scope.launch { db.stopDao().upsert(stop.copy(verified = true)) }
-                                    }) {
-                                        Text("Confirmar")
+                                    if (!stop.verified) {
+                                        TextButton(onClick = {
+                                            scope.launch { db.stopDao().upsert(stop.copy(verified = true)) }
+                                        }) {
+                                            Text("Confirmar")
+                                        }
+                                    }
+                                    if (hasCoords) {
+                                        TextButton(onClick = {
+                                            showMap = true
+                                            scope.launch {
+                                                cameraPositionState.animate(
+                                                    CameraUpdateFactory.newLatLngZoom(
+                                                        LatLng(stop.latitude!!, stop.longitude!!),
+                                                        16f
+                                                    )
+                                                )
+                                            }
+                                        }) {
+                                            Text("Ver en mapa")
+                                        }
                                     }
                                     TextButton(onClick = {
                                         scope.launch { db.stopDao().delete(stop.id) }
