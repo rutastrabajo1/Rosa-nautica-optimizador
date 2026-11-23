@@ -14,6 +14,3 @@ data class Stop(
     val verified: Boolean = false,
     val orderIndex: Int = 0
 )
-
-
-==========================================================================================
