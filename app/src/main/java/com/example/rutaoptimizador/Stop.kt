@@ -12,5 +12,6 @@ data class Stop(
     val longitude: Double? = null,
     val source: String = "OCR",
     val verified: Boolean = false,
-    val orderIndex: Int = 0
+    val orderIndex: Int = 0,
+    val type: String = "ENTREGA"
 )
