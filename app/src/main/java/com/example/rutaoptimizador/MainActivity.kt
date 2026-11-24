@@ -13,9 +13,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.widget.VideoView
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -465,7 +463,7 @@ private fun RutaScreen(db: AppDatabase) {
     val startStopId by remember { mutableStateOf<String?>(null) }
     val endStopId by remember { mutableStateOf<String?>(null) }
 
-    var hasLocationPermission by remember {
+    val hasLocationPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(
                 context,
@@ -784,7 +782,7 @@ private fun RutaScreen(db: AppDatabase) {
                     TextButton(
                         onClick = {
                             scope.launch {
-                                db.stopDao().deleteAll()
+                                stops.forEach { stop -> db.stopDao().delete(stop) }
                                 showClearDialog = false
                                 status = "Ruta limpiada"
                             }
