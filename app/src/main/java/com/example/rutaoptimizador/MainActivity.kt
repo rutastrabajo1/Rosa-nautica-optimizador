@@ -522,4 +522,302 @@ private fun RutaScreen(db: AppDatabase) {
         val filtered = parts.filterNot { part ->
             val hasDigits = part.any { it.isDigit() }
             val isKnownColonyOrCity = listOf(
-                "APODACA", "NUEVO LE
+                "APODACA", "NUEVO LEON", "NUEVO LEÓN", "MEXICO", "MÉXICO",
+                "PUEBLO NUEVO", "HUINALA", "HUINALÁ", "CONCORDIA", "MILIMEX",
+                "SENDEROS", "ENCINOS", "TREBOLES", "TRÉBOLES", "CENTRO"
+            ).any { kw -> part.contains(kw, ignoreCase = true) }
+
+            !hasDigits && !isKnownColonyOrCity && part.split(" ").size in 2..5
+        }
+        return if (filtered.isNotEmpty()) filtered.joinToString(", ") else raw
+    }
+
+    suspend fun geocodeAddress(rawAddress: String): LatLng? = withContext(Dispatchers.IO) {
+        try {
+            val geocoder = Geocoder(context, Locale("es", "MX"))
+            val cleanForSearch = sanitizeAddressForGeocoding(rawAddress)
+            val postalCode = extractPostalCode(cleanForSearch) ?: extractPostalCode(rawAddress)
+
+            var cpCenter: LatLng? = null
+            if (postalCode != null) {
+                @Suppress("DEPRECATION")
+                val cpResults = geocoder.getFromLocationName("$postalCode, Apodaca, Nuevo León, México", 1)
+                cpCenter = cpResults?.firstOrNull()?.let { LatLng(it.latitude, it.longitude) }
+            }
+
+            val query = when {
+                postalCode != null && !cleanForSearch.contains("México", ignoreCase = true) ->
+                    "$cleanForSearch, CP $postalCode, Apodaca, Nuevo León, México"
+                cleanForSearch.contains("Nuevo León", ignoreCase = true) ||
+                        cleanForSearch.contains("México", ignoreCase = true) ->
+                    cleanForSearch
+                else -> "$cleanForSearch, Apodaca, Nuevo León, México"
+            }
+
+            @Suppress("DEPRECATION")
+            val results = geocoder.getFromLocationName(query, 3)
+            val chosen = results?.firstOrNull() ?: run {
+                @Suppress("DEPRECATION")
+                geocoder.getFromLocationName(rawAddress, 1)?.firstOrNull()
+            }
+            chosen?.let { LatLng(it.latitude, it.longitude) } ?: cpCenter
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Text(
+                        text = if (showMap) "Mapa de Ruta" else "Paradas (${stops.size})",
+                        fontWeight = FontWeight.Bold
+                    )
+                },
+                actions = {
+                    IconButton(onClick = { showMap = !showMap }) {
+                        Icon(
+                            imageVector = if (showMap) Icons.Outlined.List else Icons.Default.Place,
+                            contentDescription = "Cambiar vista"
+                        )
+                    }
+                    IconButton(onClick = { menuExpanded = true }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "Opciones")
+                    }
+                    DropdownMenu(
+                        expanded = menuExpanded,
+                        onDismissRequest = { menuExpanded = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Optimizar ruta") },
+                            leadingIcon = { Icon(Icons.Default.Refresh, contentDescription = null) },
+                            onClick = {
+                                menuExpanded = false
+                                scope.launch {
+                                    busy = true
+                                    val gps = getLastKnownLatLng()
+                                    val withCoords = stops.filter { it.latitude != null && it.longitude != null }
+                                    if (withCoords.isNotEmpty()) {
+                                        val optimized = optimizeStopsRoute(
+                                            stopsWithCoords = withCoords,
+                                            startFromCurrentGps = startFromGps,
+                                            currentLatLng = gps,
+                                            fixedStartId = startStopId,
+                                            fixedEndId = endStopId
+                                        )
+                                        db.stopDao().updateAll(optimized)
+                                        status = "Ruta optimizada (${optimized.size} paradas)"
+                                    } else {
+                                        status = "Sin coordenadas para optimizar"
+                                    }
+                                    busy = false
+                                }
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Limpiar ruta") },
+                            leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null) },
+                            onClick = {
+                                menuExpanded = false
+                                showClearDialog = true
+                            }
+                        )
+                    }
+                }
+            )
+        },
+        floatingActionButton = {
+            FloatingActionButton(
+                onClick = { showAddSheet = true },
+                containerColor = NauticalTeal,
+                contentColor = CardWhite
+            ) {
+                Icon(Icons.Default.Add, contentDescription = "Agregar parada")
+            }
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(SurfaceBg)
+                .padding(padding)
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                shape = RoundedCornerShape(12.dp),
+                color = CardWhite
+            ) {
+                Text(
+                    text = if (busy) "Procesando..." else status,
+                    modifier = Modifier.padding(12.dp),
+                    color = TextDark,
+                    fontSize = 13.sp
+                )
+            }
+
+            if (showMap) {
+                GoogleMap(
+                    modifier = Modifier.fillMaxSize(),
+                    cameraPositionState = cameraPositionState,
+                    properties = MapProperties(isMyLocationEnabled = hasLocationPermission)
+                ) {
+                    stops.forEachIndexed { index, stop ->
+                        val lat = stop.latitude
+                        val lng = stop.longitude
+                        if (lat != null && lng != null) {
+                            Marker(
+                                state = MarkerState(position = LatLng(lat, lng)),
+                                title = "#${index + 1} ${stop.address}",
+                                snippet = stop.type,
+                                icon = createNumberedMarkerIcon(
+                                    type = stop.type,
+                                    stopNumber = index + 1,
+                                    isStart = index == 0,
+                                    isEnd = index == stops.lastIndex && stops.size > 1
+                                )
+                            )
+                        }
+                    }
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    itemsIndexed(stops, key = { _, item -> item.id }) { index, stop ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = CardDefaults.cardColors(containerColor = CardWhite)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(34.dp)
+                                        .clip(CircleShape)
+                                        .background(NavyCard),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = "${index + 1}",
+                                        color = CardWhite,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 14.sp
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = stop.address,
+                                        color = TextDark,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = stop.type,
+                                        color = TextMuted,
+                                        fontSize = 12.sp
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (showAddSheet) {
+            ModalBottomSheet(onDismissRequest = { showAddSheet = false }) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text("Nueva parada", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                    OutlinedTextField(
+                        value = manualAddress,
+                        onValueChange = { manualAddress = it },
+                        label = { Text("Dirección") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf("ENTREGA", "RECOLECCION", "COBRO").forEach { tipo ->
+                            FilterChip(
+                                selected = manualType == tipo,
+                                onClick = { manualType = tipo },
+                                label = { Text(tipo) }
+                            )
+                        }
+                    }
+                    Button(
+                        onClick = {
+                            val addr = manualAddress.trim()
+                            if (addr.isNotEmpty()) {
+                                scope.launch {
+                                    busy = true
+                                    val coords = geocodeAddress(addr)
+                                    val newStop = Stop(
+                                        id = UUID.randomUUID().toString(),
+                                        address = addr,
+                                        latitude = coords?.latitude,
+                                        longitude = coords?.longitude,
+                                        source = "MANUAL",
+                                        verified = coords != null,
+                                        orderIndex = stops.size,
+                                        type = manualType
+                                    )
+                                    db.stopDao().insert(newStop)
+                                    manualAddress = ""
+                                    showAddSheet = false
+                                    status = "Parada agregada"
+                                    busy = false
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Guardar parada")
+                    }
+                }
+            }
+        }
+
+        if (showClearDialog) {
+            AlertDialog(
+                onDismissRequest = { showClearDialog = false },
+                title = { Text("Limpiar paradas") },
+                text = { Text("¿Deseas eliminar todas las paradas de la ruta actual?") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            scope.launch {
+                                db.stopDao().deleteAll()
+                                selectedIds = emptySet()
+                                showClearDialog = false
+                                status = "Ruta limpiada"
+                            }
+                        }
+                    ) {
+                        Text("Eliminar")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showClearDialog = false }) {
+                        Text("Cancelar")
+                    }
+                }
+            )
+        }
+    }
+}
