@@ -102,6 +102,7 @@ import kotlin.math.sqrt
 private const val APP_VERSION = "1.6.5"
 private const val PREFS_NAME = "ruta_optimizador_prefs"
 private const val KEY_GEMINI_API_KEY = "gemini_api_key"
+private const val DEFAULT_GEMINI_API_KEY = ""
 
 // Paleta Náutica Profesional (Rosa Náutica Optimizador)
 private val NavyDeep = Color(0xFF041930)
@@ -842,7 +843,11 @@ private fun RutaScreen(db: AppDatabase) {
     val prefs = remember(context) { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
 
     var geminiApiKey by remember {
-        mutableStateOf(prefs.getString(KEY_GEMINI_API_KEY, "").orEmpty())
+        mutableStateOf(
+            prefs.getString(KEY_GEMINI_API_KEY, null)?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: DEFAULT_GEMINI_API_KEY
+        )
     }
     var geminiKeyInput by remember { mutableStateOf(geminiApiKey) }
     var showGeminiKeyDialog by remember { mutableStateOf(false) }
@@ -1659,7 +1664,7 @@ private fun RutaScreen(db: AppDatabase) {
                         OutlinedTextField(
                             value = geminiKeyInput,
                             onValueChange = { geminiKeyInput = it },
-                            label = { Text("AIza...", color = TextMutedLight) },
+                            label = { Text("AQ.Ab8R... / AIza...", color = TextMutedLight) },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                             colors = OutlinedTextFieldDefaults.colors(
@@ -1675,7 +1680,7 @@ private fun RutaScreen(db: AppDatabase) {
                     Button(
                         onClick = {
                             val trimmed = geminiKeyInput.trim()
-                            geminiApiKey = trimmed
+                            geminiApiKey = trimmed.ifEmpty { DEFAULT_GEMINI_API_KEY }
                             prefs.edit().putString(KEY_GEMINI_API_KEY, trimmed).apply()
                             showGeminiKeyDialog = false
                             status = if (trimmed.isNotEmpty()) {
