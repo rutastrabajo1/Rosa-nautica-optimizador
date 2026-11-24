@@ -2,6 +2,7 @@ package com.example.rutaoptimizador
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -41,6 +42,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
@@ -82,6 +84,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.Locale
 import java.util.UUID
 import kotlin.coroutines.resume
@@ -90,7 +99,9 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-private const val APP_VERSION = "1.6.3"
+private const val APP_VERSION = "1.6.5"
+private const val PREFS_NAME = "ruta_optimizador_prefs"
+private const val KEY_GEMINI_API_KEY = "gemini_api_key"
 
 // Paleta Náutica Profesional (Rosa Náutica Optimizador)
 private val NavyDeep = Color(0xFF041930)
@@ -127,6 +138,119 @@ private fun buildGoogleMapsSearchUrl(address: String, lat: Double? = null, lng: 
         Uri.encode(normalized)
     }
     return "https://www.google.com/maps/search/?api=1&query=$query"
+}
+
+private suspend fun orderStopsWithGemini(
+    apiKey: String,
+    orderedStops: List<Stop>,
+    startFromGps: Boolean,
+    gps: LatLng?,
+    startStopId: String?,
+    endStopId: String?
+): Result<List<String>> = withContext(Dispatchers.IO) {
+    try {
+        val stopsArray = JSONArray()
+        orderedStops.forEachIndexed { idx, s ->
+            val obj = JSONObject()
+                .put("id", s.id)
+                .put("pos", idx + 1)
+                .put("address", s.address)
+                .put("type", s.type)
+            if (s.latitude != null && s.longitude != null) {
+                obj.put("lat", s.latitude).put("lng", s.longitude)
+            }
+            stopsArray.put(obj)
+        }
+
+        val configInfo = buildString {
+            append("Zona de reparto: Apodaca y Huinalá, Nuevo León, México. ")
+            if (startFromGps && gps != null) {
+                append("Inicio sugerido cerca de coordenadas GPS (${gps.latitude},${gps.longitude}). ")
+            } else if (startStopId != null) {
+                append("La parada con id '$startStopId' debe ir al inicio (#1). ")
+            }
+            if (endStopId != null) {
+                append("La parada con id '$endStopId' debe ir al final. ")
+            }
+            append(
+                "Ordena las paradas con sentido vial y lógico de reparto: agrupa calles, privadas y colonias contiguas en un avance fluido sin saltar de un extremo a otro ni retroceder a colonias ya recorridas. " +
+                    "Devuelve EXCLUSIVAMENTE un arreglo JSON de strings con los mismos id recibidos, sin texto extra ni markdown."
+            )
+        }
+
+        val payload = JSONObject().apply {
+            put(
+                "contents",
+                JSONArray().put(
+                    JSONObject().put(
+                        "parts",
+                        JSONArray()
+                            .put(JSONObject().put("text", configInfo))
+                            .put(JSONObject().put("text", stopsArray.toString()))
+                    )
+                )
+            )
+            put(
+                "generationConfig",
+                JSONObject()
+                    .put("temperature", 0.2)
+                    .put("responseMimeType", "application/json")
+            )
+        }
+
+        val endpoint = URL(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${Uri.encode(apiKey.trim())}"
+        )
+        val conn = (endpoint.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 15000
+            readTimeout = 25000
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+        }
+
+        OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
+            writer.write(payload.toString())
+            writer.flush()
+        }
+
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val responseText = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+        conn.disconnect()
+
+        if (code !in 200..299) {
+            return@withContext Result.failure(Exception("HTTP $code de Gemini"))
+        }
+
+        val root = JSONObject(responseText)
+        val candidates = root.optJSONArray("candidates")
+        val content = candidates?.optJSONObject(0)?.optJSONObject("content")
+        val parts = content?.optJSONArray("parts")
+        val rawJson = parts?.optJSONObject(0)?.optString("text", "")?.trim().orEmpty()
+
+        val cleanedJson = rawJson
+            .removePrefix("```json")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+
+        val idArray = JSONArray(cleanedJson)
+        val returnedIds = mutableListOf<String>()
+        for (i in 0 until idArray.length()) {
+            val id = idArray.optString(i, "").trim()
+            if (id.isNotEmpty()) returnedIds.add(id)
+        }
+
+        val expectedSet = orderedStops.map { it.id }.toSet()
+        if (returnedIds.size != orderedStops.size || returnedIds.toSet() != expectedSet) {
+            return@withContext Result.failure(Exception("Respuesta incompleta o con IDs distintos"))
+        }
+
+        Result.success(returnedIds)
+    } catch (e: Exception) {
+        Result.failure(e)
+    }
 }
 
 object AddressExtractor {
@@ -527,30 +651,46 @@ private fun optimizeStopsRoute(
         anchorLng = first.longitude!!
     }
 
+    if (respectStreetSequence) {
+        val remaining = middlePool.toMutableList()
+        while (remaining.isNotEmpty()) {
+            val current = remaining.removeAt(0)
+            route.add(current)
+
+            val nearbySameClusterIndices = mutableListOf<Int>()
+            for (i in remaining.indices) {
+                val cand = remaining[i]
+                val dist = haversineMeters(
+                    current.latitude!!,
+                    current.longitude!!,
+                    cand.latitude!!,
+                    cand.longitude!!
+                )
+                if (dist <= 220.0 && streetClusterKey(cand) == streetClusterKey(current)) {
+                    nearbySameClusterIndices.add(i)
+                }
+            }
+
+            for (idx in nearbySameClusterIndices.reversed()) {
+                val grouped = remaining.removeAt(idx)
+                route.add(grouped)
+            }
+        }
+        if (endStop != null) {
+            route.add(endStop)
+        }
+        return route.mapIndexed { idx, stop -> stop.copy(orderIndex = idx) }
+    }
+
     while (middlePool.isNotEmpty()) {
-        val currentAnchorKey = route.lastOrNull()?.let { streetClusterKey(it) } ?: ""
         val nextIdx = middlePool.indices.minByOrNull { i ->
             val candidate = middlePool[i]
-            val dist = haversineMeters(
+            haversineMeters(
                 anchorLat,
                 anchorLng,
                 candidate.latitude!!,
                 candidate.longitude!!
             )
-            if (!respectStreetSequence) {
-                dist
-            } else {
-                val candKey = streetClusterKey(candidate)
-                val sameCluster = candKey == currentAnchorKey
-                val clusterMultiplier = when {
-                    sameCluster && dist < 800.0 -> 0.45
-                    sameCluster -> 0.72
-                    dist < 300.0 -> 0.95
-                    else -> 1.35
-                }
-                val sequenceBias = 1.0 + (i.toDouble() / (middlePool.size + 1).toDouble()) * 0.25
-                dist * clusterMultiplier * sequenceBias
-            }
         } ?: 0
 
         val chosen = middlePool.removeAt(nextIdx)
@@ -563,71 +703,10 @@ private fun optimizeStopsRoute(
         route.add(endStop)
     }
 
-    val lockStart = startStop != null
-    val lockEnd = endStop != null
-    val optFrom = if (lockStart) 1 else 0
-    val optTo = if (lockEnd) route.size - 2 else route.size - 1
-    val improvementThresholdMeters = if (respectStreetSequence) 450.0 else 15.0
-
-    if (optTo - optFrom >= 2) {
-        var improved = true
-        var passes = 0
-        while (improved && passes < 8) {
-            improved = false
-            passes++
-            for (i in optFrom until optTo) {
-                for (k in i + 1..optTo) {
-                    if (respectStreetSequence && streetClusterKey(route[i]) == streetClusterKey(route[k])) {
-                        continue
-                    }
-
-                    val prevLat = if (i == 0 && startFromCurrentGps && currentLatLng != null) {
-                        currentLatLng.latitude
-                    } else if (i > 0) {
-                        route[i - 1].latitude!!
-                    } else null
-
-                    val prevLng = if (i == 0 && startFromCurrentGps && currentLatLng != null) {
-                        currentLatLng.longitude
-                    } else if (i > 0) {
-                        route[i - 1].longitude!!
-                    } else null
-
-                    val nextLat = if (k + 1 < route.size) route[k + 1].latitude!! else null
-                    val nextLng = if (k + 1 < route.size) route[k + 1].longitude!! else null
-
-                    val currentEdgeCost =
-                        (if (prevLat != null && prevLng != null) {
-                            haversineMeters(prevLat, prevLng, route[i].latitude!!, route[i].longitude!!)
-                        } else 0.0) +
-                            (if (nextLat != null && nextLng != null) {
-                                haversineMeters(route[k].latitude!!, route[k].longitude!!, nextLat, nextLng)
-                            } else 0.0)
-
-                    val swappedEdgeCost =
-                        (if (prevLat != null && prevLng != null) {
-                            haversineMeters(prevLat, prevLng, route[k].latitude!!, route[k].longitude!!)
-                        } else 0.0) +
-                            (if (nextLat != null && nextLng != null) {
-                                haversineMeters(route[i].latitude!!, route[i].longitude!!, nextLat, nextLng)
-                            } else 0.0)
-
-                    if (swappedEdgeCost + improvementThresholdMeters < currentEdgeCost) {
-                        val sub = route.subList(i, k + 1).reversed()
-                        for (offset in sub.indices) {
-                            route[i + offset] = sub[offset]
-                        }
-                        improved = true
-                    }
-                }
-            }
-        }
-    }
-
     return route.mapIndexed { idx, stop -> stop.copy(orderIndex = idx) }
 }
 
-private suspend fun recognizeTextFromUri(context: android.content.Context, uri: Uri): String =
+private suspend fun recognizeTextFromUri(context: Context, uri: Uri): String =
     withContext(Dispatchers.IO) {
         val bitmap: Bitmap? = context.contentResolver.openInputStream(uri)?.use { stream ->
             BitmapFactory.decodeStream(stream)
@@ -760,6 +839,13 @@ private fun RutaScreen(db: AppDatabase) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val stops by db.stopDao().observeAll().collectAsState(initial = emptyList())
+    val prefs = remember(context) { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
+
+    var geminiApiKey by remember {
+        mutableStateOf(prefs.getString(KEY_GEMINI_API_KEY, "").orEmpty())
+    }
+    var geminiKeyInput by remember { mutableStateOf(geminiApiKey) }
+    var showGeminiKeyDialog by remember { mutableStateOf(false) }
 
     var status by remember { mutableStateOf("Listo para cargar capturas de ruta") }
     var busy by remember { mutableStateOf(false) }
@@ -1000,11 +1086,57 @@ private fun RutaScreen(db: AppDatabase) {
                 }
                 else -> "optimizada"
             }
-            status = "Ruta optimizada $originLabel (${optimized.size} con GPS)"
+            status = if (respectSequence) {
+                "Secuencia conservada y agrupada $originLabel (${optimized.size} con GPS)"
+            } else {
+                "Ruta optimizada por cercanía $originLabel (${optimized.size} con GPS)"
+            }
         } else {
             status = "Sin coordenadas para optimizar"
         }
         busy = false
+    }
+
+    fun runGeminiLogicalOrder() {
+        if (busy) return
+        if (stops.size <= 1) {
+            status = "Agrega al menos 2 paradas para ordenar con Gemini"
+            return
+        }
+        if (geminiApiKey.isBlank()) {
+            geminiKeyInput = geminiApiKey
+            showGeminiKeyDialog = true
+            return
+        }
+        scope.launch {
+            busy = true
+            status = "Consultando sentido lógico con Gemini..."
+            val ordered = stops.sortedBy { it.orderIndex }
+            val gps = getLastKnownLatLng()
+            val result = orderStopsWithGemini(
+                apiKey = geminiApiKey,
+                orderedStops = ordered,
+                startFromGps = startFromGps,
+                gps = gps,
+                startStopId = startStopId,
+                endStopId = endStopId
+            )
+            result.onSuccess { sortedIds ->
+                val byId = ordered.associateBy { it.id }
+                val reordered = sortedIds.mapIndexedNotNull { idx, id ->
+                    byId[id]?.copy(orderIndex = idx)
+                }
+                if (reordered.size == ordered.size) {
+                    db.stopDao().upsertAll(reordered)
+                    status = "Orden lógico aplicado con Gemini (${reordered.size} paradas)"
+                } else {
+                    status = "No se aplicó cambio: respuesta incompleta de Gemini"
+                }
+            }.onFailure { err ->
+                status = "Gemini no aplicado (${err.message ?: "error de red"})"
+            }
+            busy = false
+        }
     }
 
     fun processScreenshotUris(uris: List<Uri>) {
@@ -1214,6 +1346,23 @@ private fun RutaScreen(db: AppDatabase) {
                             containerColor = NavyCard
                         ) {
                             DropdownMenuItem(
+                                text = { Text("Orden lógico (Gemini)", color = GoldCobro, fontWeight = FontWeight.SemiBold) },
+                                leadingIcon = { Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = GoldCobro) },
+                                onClick = {
+                                    menuExpanded = false
+                                    runGeminiLogicalOrder()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Configurar API Key Gemini", color = TextLight) },
+                                leadingIcon = { Icon(Icons.Default.Tune, contentDescription = null, tint = GoldCobro) },
+                                onClick = {
+                                    menuExpanded = false
+                                    geminiKeyInput = geminiApiKey
+                                    showGeminiKeyDialog = true
+                                }
+                            )
+                            DropdownMenuItem(
                                 text = { Text("Inicio y fin de ruta", color = TextLight) },
                                 leadingIcon = { Icon(Icons.Default.Tune, contentDescription = null, tint = NauticalTeal) },
                                 onClick = {
@@ -1349,6 +1498,9 @@ private fun RutaScreen(db: AppDatabase) {
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
+                    TextButton(onClick = { runGeminiLogicalOrder() }) {
+                        Text("Gemini", color = GoldCobro, fontWeight = FontWeight.Bold)
+                    }
                     TextButton(onClick = { showRouteConfigDialog = true }) {
                         Text("Inicio/Fin", color = NauticalMint, fontWeight = FontWeight.Bold)
                     }
@@ -1488,6 +1640,61 @@ private fun RutaScreen(db: AppDatabase) {
                     }
                 }
             }
+        }
+
+        if (showGeminiKeyDialog) {
+            AlertDialog(
+                onDismissRequest = { showGeminiKeyDialog = false },
+                containerColor = NavyCard,
+                titleContentColor = TextLight,
+                textContentColor = TextLight,
+                title = { Text("API Key de Gemini", fontWeight = FontWeight.Bold) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(
+                            text = "Pega tu clave de Gemini API para ordenar las paradas por sentido lógico de zona y calles:",
+                            color = TextMutedLight,
+                            fontSize = 13.sp
+                        )
+                        OutlinedTextField(
+                            value = geminiKeyInput,
+                            onValueChange = { geminiKeyInput = it },
+                            label = { Text("AIza...", color = TextMutedLight) },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = TextLight,
+                                unfocusedTextColor = TextLight,
+                                focusedBorderColor = GoldCobro,
+                                unfocusedBorderColor = NavyBorder
+                            )
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            val trimmed = geminiKeyInput.trim()
+                            geminiApiKey = trimmed
+                            prefs.edit().putString(KEY_GEMINI_API_KEY, trimmed).apply()
+                            showGeminiKeyDialog = false
+                            status = if (trimmed.isNotEmpty()) {
+                                "API Key de Gemini guardada"
+                            } else {
+                                "API Key de Gemini borrada"
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = GoldCobro)
+                    ) {
+                        Text("Guardar", color = NavyDeep, fontWeight = FontWeight.Bold)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showGeminiKeyDialog = false }) {
+                        Text("Cancelar", color = TextLight)
+                    }
+                }
+            )
         }
 
         if (showPositionDialog) {
