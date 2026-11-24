@@ -9,11 +9,15 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.SurfaceTexture
+import android.location.Address
 import android.location.Geocoder
 import android.location.LocationManager
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
-import android.widget.VideoView
+import android.view.Surface
+import android.view.TextureView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -34,6 +38,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
@@ -69,6 +75,7 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -80,7 +87,7 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-private const val APP_VERSION = "1.5.8"
+private const val APP_VERSION = "1.6.2"
 
 // Paleta Náutica Profesional (Rosa Náutica Optimizador)
 private val NavyDeep = Color(0xFF041930)
@@ -229,7 +236,8 @@ fun SplashVideoScreen(
 ) {
     val context = LocalContext.current
     var hasFinished by remember { mutableStateOf(false) }
-    var isStarted by remember { mutableStateOf(false) }
+    var isPreparedAndStarted by remember { mutableStateOf(false) }
+    var activeSurface by remember { mutableStateOf<Surface?>(null) }
 
     fun finishOnce() {
         if (!hasFinished) {
@@ -238,20 +246,15 @@ fun SplashVideoScreen(
         }
     }
 
-    val videoView = remember(context) {
-        VideoView(context).apply {
-            val uri = Uri.parse("android.resource://${context.packageName}/${R.raw.splash_rosa_nautica}")
-            setVideoURI(uri)
-            setOnPreparedListener { mediaPlayer ->
-                mediaPlayer.isLooping = false
-                mediaPlayer.setOnInfoListener { _, _, _ -> false }
-                if (!isStarted && !hasFinished) {
-                    isStarted = true
-                    start()
-                }
-            }
+    LaunchedEffect(Unit) {
+        delay(8000L)
+        finishOnce()
+    }
+
+    val mediaPlayer = remember(context) {
+        MediaPlayer().apply {
+            isLooping = false
             setOnCompletionListener {
-                stopPlayback()
                 finishOnce()
             }
             setOnErrorListener { _, _, _ ->
@@ -261,10 +264,15 @@ fun SplashVideoScreen(
         }
     }
 
-    DisposableEffect(videoView) {
+    DisposableEffect(mediaPlayer) {
         onDispose {
             try {
-                videoView.stopPlayback()
+                if (mediaPlayer.isPlaying) mediaPlayer.stop()
+                mediaPlayer.release()
+            } catch (_: Exception) {
+            }
+            try {
+                activeSurface?.release()
             } catch (_: Exception) {
             }
         }
@@ -278,8 +286,62 @@ fun SplashVideoScreen(
     ) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
-            factory = { videoView }
+            factory = { ctx ->
+                TextureView(ctx).apply {
+                    surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                        override fun onSurfaceTextureAvailable(
+                            surfaceTexture: SurfaceTexture,
+                            width: Int,
+                            height: Int
+                        ) {
+                            if (hasFinished || isPreparedAndStarted) return
+                            try {
+                                mediaPlayer.reset()
+                                val uri = Uri.parse("android.resource://${ctx.packageName}/${R.raw.splash_rosa_nautica}")
+                                mediaPlayer.setDataSource(ctx, uri)
+                                val outSurface = Surface(surfaceTexture)
+                                activeSurface = outSurface
+                                mediaPlayer.setSurface(outSurface)
+                                mediaPlayer.setOnPreparedListener { mp ->
+                                    if (!hasFinished && !isPreparedAndStarted) {
+                                        isPreparedAndStarted = true
+                                        mp.start()
+                                    }
+                                }
+                                mediaPlayer.prepareAsync()
+                            } catch (_: Exception) {
+                                finishOnce()
+                            }
+                        }
+
+                        override fun onSurfaceTextureSizeChanged(
+                            surfaceTexture: SurfaceTexture,
+                            width: Int,
+                            height: Int
+                        ) = Unit
+
+                        override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
+                            return true
+                        }
+
+                        override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) = Unit
+                    }
+                }
+            }
         )
+        TextButton(
+            onClick = { finishOnce() },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .statusBarsPadding()
+                .padding(12.dp)
+        ) {
+            Text(
+                text = "Omitir",
+                color = TextLight.copy(alpha = 0.85f),
+                fontWeight = FontWeight.SemiBold
+            )
+        }
     }
 }
 
@@ -768,6 +830,18 @@ private fun RutaScreen(db: AppDatabase) {
         return if (parts.isNotEmpty()) parts.joinToString(", ") else raw.trim()
     }
 
+    fun isSpecificAddressMatch(addr: Address, postalCode: String?): Boolean {
+        val hasStreet = !addr.thoroughfare.isNullOrBlank()
+        val feature = addr.featureName?.trim().orEmpty()
+        val isGenericMunicipalityOrCp = feature.isBlank() ||
+            feature.equals("Ciudad Apodaca", ignoreCase = true) ||
+            feature.equals("Apodaca", ignoreCase = true) ||
+            feature.equals("Nuevo León", ignoreCase = true) ||
+            feature.equals("Nuevo Leon", ignoreCase = true) ||
+            (postalCode != null && feature == postalCode)
+        return hasStreet || !isGenericMunicipalityOrCp
+    }
+
     suspend fun geocodeAddress(rawAddress: String): LatLng? = withContext(Dispatchers.IO) {
         try {
             val geocoder = Geocoder(context, Locale("es", "MX"))
@@ -798,11 +872,15 @@ private fun RutaScreen(db: AppDatabase) {
 
             @Suppress("DEPRECATION")
             val results = geocoder.getFromLocationName(query, 5)
-            val validCandidate = results
-                ?.map { LatLng(it.latitude, it.longitude) }
-                ?.firstOrNull { isWithinZone(it, searchAnchor, maxAllowedMeters) }
+            val validSpecificCandidate = results
+                ?.firstOrNull { addr ->
+                    val pt = LatLng(addr.latitude, addr.longitude)
+                    isWithinZone(pt, searchAnchor, maxAllowedMeters) && isSpecificAddressMatch(addr, postalCode)
+                }
+                ?.let { LatLng(it.latitude, it.longitude) }
 
-            validCandidate ?: cpCenter
+            // No cae al centro de Apodaca ni a centroides genéricos si no hay coincidencia específica
+            validSpecificCandidate
         } catch (_: Exception) {
             null
         }
@@ -811,11 +889,58 @@ private fun RutaScreen(db: AppDatabase) {
     fun openGoogleMapsForStop(stop: Stop) {
         val mapsUrl = buildGoogleMapsSearchUrl(
             address = stop.address,
-            lat = stop.latitude,
-            lng = stop.longitude
+            lat = null,
+            lng = null
         )
         val intent = Intent(Intent.ACTION_VIEW, Uri.parse(mapsUrl))
         context.startActivity(intent)
+    }
+
+    fun moveStopInList(stopId: String, delta: Int) {
+        if (busy) return
+        scope.launch {
+            val ordered = stops.sortedBy { it.orderIndex }.toMutableList()
+            val currentIdx = ordered.indexOfFirst { it.id == stopId }
+            if (currentIdx < 0) return@launch
+            val targetIdx = (currentIdx + delta).coerceIn(0, ordered.lastIndex)
+            if (targetIdx == currentIdx) return@launch
+
+            val item = ordered.removeAt(currentIdx)
+            ordered.add(targetIdx, item)
+            val reindexed = ordered.mapIndexed { idx, s -> s.copy(orderIndex = idx) }
+            db.stopDao().upsertAll(reindexed)
+            status = "Parada movida a posición #${targetIdx + 1}"
+        }
+    }
+
+    fun moveSelectedStops(delta: Int) {
+        if (busy || selectedIds.isEmpty()) return
+        scope.launch {
+            val ordered = stops.sortedBy { it.orderIndex }.toMutableList()
+            val selectedSet = selectedIds.toSet()
+
+            if (delta < 0) {
+                for (i in 1 until ordered.size) {
+                    if (ordered[i].id in selectedSet && ordered[i - 1].id !in selectedSet) {
+                        val tmp = ordered[i - 1]
+                        ordered[i - 1] = ordered[i]
+                        ordered[i] = tmp
+                    }
+                }
+            } else if (delta > 0) {
+                for (i in ordered.size - 2 downTo 0) {
+                    if (ordered[i].id in selectedSet && ordered[i + 1].id !in selectedSet) {
+                        val tmp = ordered[i + 1]
+                        ordered[i + 1] = ordered[i]
+                        ordered[i] = tmp
+                    }
+                }
+            }
+
+            val reindexed = ordered.mapIndexed { idx, s -> s.copy(orderIndex = idx) }
+            db.stopDao().upsertAll(reindexed)
+            status = if (delta < 0) "Selección subida en la ruta" else "Selección bajada en la ruta"
+        }
     }
 
     suspend fun runOptimization(
@@ -973,6 +1098,12 @@ private fun RutaScreen(db: AppDatabase) {
                         )
                     },
                     actions = {
+                        IconButton(onClick = { moveSelectedStops(-1) }) {
+                            Icon(Icons.Default.ArrowUpward, contentDescription = "Subir parada", tint = NauticalMint)
+                        }
+                        IconButton(onClick = { moveSelectedStops(1) }) {
+                            Icon(Icons.Default.ArrowDownward, contentDescription = "Bajar parada", tint = NauticalTeal)
+                        }
                         if (selectedIds.size >= 2) {
                             TextButton(onClick = { groupSelectedStops() }) {
                                 Text("Agrupar", color = NauticalTeal, fontWeight = FontWeight.Bold)
@@ -1270,6 +1401,30 @@ private fun RutaScreen(db: AppDatabase) {
                                         color = TextMutedLight,
                                         fontSize = 12.sp
                                     )
+                                }
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    IconButton(
+                                        onClick = { moveStopInList(stop.id, -1) },
+                                        modifier = Modifier.size(28.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.ArrowUpward,
+                                            contentDescription = "Subir en orden",
+                                            tint = NauticalMint,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = { moveStopInList(stop.id, 1) },
+                                        modifier = Modifier.size(28.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.ArrowDownward,
+                                            contentDescription = "Bajar en orden",
+                                            tint = NauticalTeal,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
                                 }
                                 IconButton(onClick = { toggleSelection(stop.id) }) {
                                     Icon(
