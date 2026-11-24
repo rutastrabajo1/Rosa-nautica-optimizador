@@ -782,7 +782,7 @@ private fun RutaScreen(db: AppDatabase) {
                     TextButton(
                         onClick = {
                             scope.launch {
-                                stops.forEach { stop -> db.stopDao().delete(stop) }
+                                stops.forEach { stop -> db.stopDao().delete(stop.id) }
                                 showClearDialog = false
                                 status = "Ruta limpiada"
                             }
