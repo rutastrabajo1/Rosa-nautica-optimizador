@@ -17,7 +17,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -25,9 +24,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.Refresh
@@ -37,7 +34,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
@@ -48,7 +44,6 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.room.Room
-import com.google.android.gms.maps.CameraUpdateFactory
 import com.google.android.gms.maps.model.BitmapDescriptor
 import com.google.android.gms.maps.model.BitmapDescriptorFactory
 import com.google.android.gms.maps.model.CameraPosition
@@ -383,7 +378,6 @@ private fun optimizeStopsRoute(
         anchorLng = first.longitude!!
     }
 
-    // 1. Construcción por vecino más cercano desde el punto de partida
     while (middlePool.isNotEmpty()) {
         val nextIdx = middlePool.indices.minByOrNull { i ->
             val candidate = middlePool[i]
@@ -399,7 +393,6 @@ private fun optimizeStopsRoute(
         route.add(endStop)
     }
 
-    // 2. Paso 2-Opt para eliminar cruces y regresos ilógicos en avenidas
     val lockStart = startStop != null
     val lockEnd = endStop != null
     val optFrom = if (lockStart) 1 else 0
@@ -465,15 +458,12 @@ private fun RutaScreen(db: AppDatabase) {
     var showMap by remember { mutableStateOf(false) }
     var showAddSheet by remember { mutableStateOf(false) }
 
-    var selectedIds by remember { mutableStateOf(setOf<String>()) }
     var showClearDialog by remember { mutableStateOf(false) }
-    var showFinishDialog by remember { mutableStateOf(false) }
     var menuExpanded by remember { mutableStateOf(false) }
 
-    // Control de punto de inicio y parada final
-    var startFromGps by remember { mutableStateOf(true) }
-    var startStopId by remember { mutableStateOf<String?>(null) }
-    var endStopId by remember { mutableStateOf<String?>(null) }
+    val startFromGps by remember { mutableStateOf(true) }
+    val startStopId by remember { mutableStateOf<String?>(null) }
+    val endStopId by remember { mutableStateOf<String?>(null) }
 
     var hasLocationPermission by remember {
         mutableStateOf(
@@ -482,13 +472,6 @@ private fun RutaScreen(db: AppDatabase) {
                 Manifest.permission.ACCESS_FINE_LOCATION
             ) == PackageManager.PERMISSION_GRANTED
         )
-    }
-
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        hasLocationPermission = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-                permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
     }
 
     val defaultCenter = LatLng(25.7815, -100.1886)
@@ -516,7 +499,6 @@ private fun RutaScreen(db: AppDatabase) {
             .firstOrNull { it.toIntOrNull() in 1000..99999 }
     }
 
-    // Limpia el nombre del cliente pegado por el escáner DHL antes de buscar en el mapa
     fun sanitizeAddressForGeocoding(raw: String): String {
         val parts = raw.split(",").map { it.trim() }.filter { it.isNotBlank() }
         val filtered = parts.filterNot { part ->
@@ -606,7 +588,7 @@ private fun RutaScreen(db: AppDatabase) {
                                             fixedStartId = startStopId,
                                             fixedEndId = endStopId
                                         )
-                                        db.stopDao().updateAll(optimized)
+                                        db.stopDao().upsertAll(optimized)
                                         status = "Ruta optimizada (${optimized.size} paradas)"
                                     } else {
                                         status = "Sin coordenadas para optimizar"
@@ -777,7 +759,7 @@ private fun RutaScreen(db: AppDatabase) {
                                         orderIndex = stops.size,
                                         type = manualType
                                     )
-                                    db.stopDao().insert(newStop)
+                                    db.stopDao().upsert(newStop)
                                     manualAddress = ""
                                     showAddSheet = false
                                     status = "Parada agregada"
@@ -803,7 +785,6 @@ private fun RutaScreen(db: AppDatabase) {
                         onClick = {
                             scope.launch {
                                 db.stopDao().deleteAll()
-                                selectedIds = emptySet()
                                 showClearDialog = false
                                 status = "Ruta limpiada"
                             }
