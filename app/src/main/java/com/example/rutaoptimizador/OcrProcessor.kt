@@ -23,3 +23,4 @@ class OcrProcessor {
                 if (cont.isActive) cont.resumeWithException(e)
             }
         }
+}
