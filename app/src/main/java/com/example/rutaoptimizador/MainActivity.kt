@@ -416,7 +416,7 @@ private fun RutaScreen(db: AppDatabase) {
                     onClick = {
                         showClearDialog = false
                         scope.launch {
-                            stops.forEach { db.stopDao().delete(it) }
+                            stops.forEach { db.stopDao().delete(it.id) }
                             selectedIds = emptySet()
                             showMap = false
                             status = "Ruta vaciada"
@@ -457,7 +457,7 @@ private fun RutaScreen(db: AppDatabase) {
                     onClick = {
                         showFinishDialog = false
                         scope.launch {
-                            stops.forEach { db.stopDao().delete(it) }
+                            stops.forEach { db.stopDao().delete(it.id) }
                             selectedIds = emptySet()
                             showMap = false
                             status = "Jornada finalizada con éxito"
@@ -630,7 +630,6 @@ private fun RutaScreen(db: AppDatabase) {
 
                 Spacer(Modifier.height(10.dp))
 
-                // Tarjetas de resumen en cabecera
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -693,7 +692,6 @@ private fun RutaScreen(db: AppDatabase) {
                 )
             }
 
-            // Barra contextual cuando hay paradas seleccionadas
             if (selectedIds.isNotEmpty() && !showMap) {
                 Surface(
                     color = Color(0xFFFEE2E2),
@@ -719,7 +717,7 @@ private fun RutaScreen(db: AppDatabase) {
                                 onClick = {
                                     scope.launch {
                                         val toDelete = stops.filter { it.id in selectedIds }
-                                        toDelete.forEach { db.stopDao().delete(it) }
+                                        toDelete.forEach { db.stopDao().delete(it.id) }
                                         val count = toDelete.size
                                         selectedIds = emptySet()
                                         status = "$count paradas eliminadas"
@@ -734,7 +732,6 @@ private fun RutaScreen(db: AppDatabase) {
                 }
             }
 
-            // Botón principal de Optimizar Ruta
             if (markers.size >= 2) {
                 Button(
                     onClick = {
@@ -893,7 +890,6 @@ private fun RutaScreen(db: AppDatabase) {
                                 modifier = Modifier.fillMaxWidth()
                             ) {
                                 Row(modifier = Modifier.fillMaxWidth()) {
-                                    // Franja lateral de color según tipo de parada
                                     Box(
                                         modifier = Modifier
                                             .width(6.dp)
@@ -910,7 +906,6 @@ private fun RutaScreen(db: AppDatabase) {
                                             verticalAlignment = Alignment.CenterVertically,
                                             modifier = Modifier.fillMaxWidth()
                                         ) {
-                                            // Círculo numerado de parada
                                             Box(
                                                 contentAlignment = Alignment.Center,
                                                 modifier = Modifier
