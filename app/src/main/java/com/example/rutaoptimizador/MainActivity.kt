@@ -22,6 +22,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -484,7 +485,52 @@ private suspend fun recognizeTextFromUri(context: android.content.Context, uri: 
         }
     }
 
-@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun SummaryStatCard(
+    title: String,
+    count: Int,
+    accentColor: Color,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .border(
+                width = if (selected) 2.dp else 1.dp,
+                color = if (selected) accentColor else NavyBorder,
+                shape = RoundedCornerShape(12.dp)
+            )
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(12.dp),
+        color = if (selected) NavyBorder.copy(alpha = 0.7f) else NavyCard
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 10.dp, horizontal = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "$count",
+                color = accentColor,
+                fontWeight = FontWeight.Bold,
+                fontSize = 20.sp
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = title,
+                color = TextLight,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
 @Composable
 private fun StopBadge(type: String, number: Int) {
     when (type) {
@@ -554,6 +600,7 @@ private fun RutaScreen(db: AppDatabase) {
     var busy by remember { mutableStateOf(false) }
     var manualAddress by remember { mutableStateOf("") }
     var manualType by remember { mutableStateOf("ENTREGA") }
+    var activeFilter by remember { mutableStateOf<String?>(null) }
     var showMap by remember { mutableStateOf(false) }
     var showAddSheet by remember { mutableStateOf(false) }
     var showClearDialog by remember { mutableStateOf(false) }
@@ -565,6 +612,14 @@ private fun RutaScreen(db: AppDatabase) {
     val startFromGps by remember { mutableStateOf(true) }
     val startStopId by remember { mutableStateOf<String?>(null) }
     val endStopId by remember { mutableStateOf<String?>(null) }
+
+    val deliveryCount = remember(stops) { stops.count { it.type == "ENTREGA" } }
+    val pickupCount = remember(stops) { stops.count { it.type == "RECOLECCION" } }
+    val codCount = remember(stops) { stops.count { it.type == "COBRO" } }
+
+    val visibleStops = remember(stops, activeFilter) {
+        if (activeFilter == null) stops else stops.filter { it.type == activeFilter }
+    }
 
     val hasLocationPermission by remember {
         mutableStateOf(
@@ -913,10 +968,49 @@ private fun RutaScreen(db: AppDatabase) {
                 .background(NavyDeep)
                 .padding(padding)
         ) {
+            // Paneles superiores de resumen (Entregas, Recolecciones y Cobros)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                SummaryStatCard(
+                    title = "Entregas",
+                    count = deliveryCount,
+                    accentColor = NauticalMint,
+                    selected = activeFilter == "ENTREGA",
+                    onClick = {
+                        activeFilter = if (activeFilter == "ENTREGA") null else "ENTREGA"
+                    },
+                    modifier = Modifier.weight(1f)
+                )
+                SummaryStatCard(
+                    title = "Recolecciones",
+                    count = pickupCount,
+                    accentColor = OrangePickup,
+                    selected = activeFilter == "RECOLECCION",
+                    onClick = {
+                        activeFilter = if (activeFilter == "RECOLECCION") null else "RECOLECCION"
+                    },
+                    modifier = Modifier.weight(1f)
+                )
+                SummaryStatCard(
+                    title = "Cobros",
+                    count = codCount,
+                    accentColor = GoldCobro,
+                    selected = activeFilter == "COBRO",
+                    onClick = {
+                        activeFilter = if (activeFilter == "COBRO") null else "COBRO"
+                    },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                    .padding(horizontal = 12.dp, vertical = 4.dp)
                     .border(1.dp, NavyBorder, RoundedCornerShape(12.dp)),
                 shape = RoundedCornerShape(12.dp),
                 color = NavyPanel
@@ -954,19 +1048,20 @@ private fun RutaScreen(db: AppDatabase) {
                     cameraPositionState = cameraPositionState,
                     properties = MapProperties(isMyLocationEnabled = hasLocationPermission)
                 ) {
-                    stops.forEachIndexed { index, stop ->
+                    visibleStops.forEachIndexed { index, stop ->
                         val lat = stop.latitude
                         val lng = stop.longitude
+                        val originalNumber = stops.indexOfFirst { it.id == stop.id } + 1
                         if (lat != null && lng != null) {
                             Marker(
                                 state = MarkerState(position = LatLng(lat, lng)),
-                                title = "#${index + 1} ${stop.address}",
+                                title = "#$originalNumber ${stop.address}",
                                 snippet = stop.type,
                                 icon = createNumberedMarkerIcon(
                                     type = stop.type,
-                                    stopNumber = index + 1,
+                                    stopNumber = originalNumber,
                                     isStart = index == 0,
-                                    isEnd = index == stops.lastIndex && stops.size > 1
+                                    isEnd = index == visibleStops.lastIndex && visibleStops.size > 1
                                 )
                             )
                         }
@@ -975,10 +1070,11 @@ private fun RutaScreen(db: AppDatabase) {
             } else {
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 96.dp),
+                    contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 96.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    itemsIndexed(stops, key = { _, item -> item.id }) { index, stop ->
+                    itemsIndexed(visibleStops, key = { _, item -> item.id }) { _, stop ->
+                        val routeNumber = stops.indexOfFirst { it.id == stop.id } + 1
                         val isSelected = selectedIds.contains(stop.id)
                         Card(
                             modifier = Modifier
@@ -1011,7 +1107,7 @@ private fun RutaScreen(db: AppDatabase) {
                                     .padding(12.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                StopBadge(type = stop.type, number = index + 1)
+                                StopBadge(type = stop.type, number = routeNumber)
                                 Spacer(modifier = Modifier.width(12.dp))
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
@@ -1158,6 +1254,7 @@ private fun RutaScreen(db: AppDatabase) {
                             scope.launch {
                                 stops.forEach { stop -> db.stopDao().delete(stop.id) }
                                 selectedIds.clear()
+                                activeFilter = null
                                 showClearDialog = false
                                 status = "Ruta limpiada"
                             }
