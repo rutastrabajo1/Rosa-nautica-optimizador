@@ -921,11 +921,13 @@ private fun RutaScreen(db: AppDatabase) {
             val ordered = stops.sortedBy { it.orderIndex }.toMutableList()
             val selectedSet = selectedIds.toSet()
             val movingItems = ordered.filter { it.id in selectedSet }
-            val remainingItems = ordered.filterNot { it.id in selectedSet }
+            val remainingItems = ordered.filterNot { it.id in selectedSet }.toMutableList()
             if (movingItems.isEmpty()) return@launch
 
             val insertIdx = (targetNumberOneBased - 1).coerceIn(0, remainingItems.size)
-            remainingItems.addAll(insertIdx, movingItems)
+            for (offset in movingItems.indices) {
+                remainingItems.add(insertIdx + offset, movingItems[offset])
+            }
             val reindexed = remainingItems.mapIndexed { idx, s -> s.copy(orderIndex = idx) }
             db.stopDao().upsertAll(reindexed)
             val finalPos = insertIdx + 1
