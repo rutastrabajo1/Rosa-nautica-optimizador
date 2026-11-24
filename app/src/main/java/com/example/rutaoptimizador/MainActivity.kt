@@ -474,7 +474,6 @@ private fun RutaScreen(db: AppDatabase) {
                 "SENDEROS", "ENCINOS", "TREBOLES", "TRÉBOLES", "CENTRO"
             ).any { kw -> part.contains(kw, ignoreCase = true) }
 
-            // Si no tiene números y no es colonia/municipio, suele ser el nombre del destinatario
             !hasDigits && !isKnownColonyOrCity && part.split(" ").size in 2..5
         }
         return if (filtered.isNotEmpty()) filtered.joinToString(", ") else raw
@@ -748,13 +747,28 @@ private fun RutaScreen(db: AppDatabase) {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Column {
-                        Text(
-                            "Rosa Náutica",
-                            color = Color.White,
-                            fontSize = 20.sp,
-                            fontWeight = FontWeight.Bold
-                        )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                "Rosa Náutica",
+                                color = Color.White,
+                                fontSize = 20.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Surface(
+                                color = NauticalTeal.copy(alpha = 0.22f),
+                                shape = RoundedCornerShape(6.dp)
+                            ) {
+                                Text(
+                                    "v1.5.0",
+                                    color = NauticalTeal,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
                         Text(
                             status,
                             color = Color(0xFFCBD5E1),
