@@ -99,7 +99,7 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-private const val APP_VERSION = "1.6.5"
+private const val APP_VERSION = "1.6.6"
 private const val PREFS_NAME = "ruta_optimizador_prefs"
 private const val KEY_GEMINI_API_KEY = "gemini_api_key"
 private const val DEFAULT_GEMINI_API_KEY = ""
@@ -141,6 +141,52 @@ private fun buildGoogleMapsSearchUrl(address: String, lat: Double? = null, lng: 
     return "https://www.google.com/maps/search/?api=1&query=$query"
 }
 
+private fun executeGeminiPost(
+    urlString: String,
+    payloadString: String,
+    apiKeyHeader: String? = null,
+    bearerToken: String? = null
+): Pair<Int, String> {
+    val conn = (URL(urlString).openConnection() as HttpURLConnection).apply {
+        requestMethod = "POST"
+        connectTimeout = 20000
+        readTimeout = 60000
+        doOutput = true
+        setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+        if (!apiKeyHeader.isNullOrBlank()) {
+            setRequestProperty("x-goog-api-key", apiKeyHeader)
+        }
+        if (!bearerToken.isNullOrBlank()) {
+            setRequestProperty("Authorization", "Bearer $bearerToken")
+        }
+    }
+
+    OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
+        writer.write(payloadString)
+        writer.flush()
+    }
+
+    val code = conn.responseCode
+    val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+    val responseText = if (stream != null) {
+        BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+    } else {
+        ""
+    }
+    conn.disconnect()
+    return code to responseText
+}
+
+private fun parseGeminiApiError(code: Int, responseText: String): String {
+    return try {
+        val errObj = JSONObject(responseText).optJSONObject("error")
+        val msg = errObj?.optString("message", "")?.trim().orEmpty()
+        if (msg.isNotEmpty()) "HTTP $code: $msg" else "HTTP $code de Gemini"
+    } catch (_: Exception) {
+        "HTTP $code de Gemini"
+    }
+}
+
 private suspend fun orderStopsWithGemini(
     apiKey: String,
     orderedStops: List<Stop>,
@@ -150,6 +196,7 @@ private suspend fun orderStopsWithGemini(
     endStopId: String?
 ): Result<List<String>> = withContext(Dispatchers.IO) {
     try {
+        val cleanKey = apiKey.trim()
         val stopsArray = JSONArray()
         orderedStops.forEachIndexed { idx, s ->
             val obj = JSONObject()
@@ -174,8 +221,8 @@ private suspend fun orderStopsWithGemini(
                 append("La parada con id '$endStopId' debe ir al final. ")
             }
             append(
-                "Ordena las paradas con sentido vial y lógico de reparto: agrupa calles, privadas y colonias contiguas en un avance fluido sin saltar de un extremo a otro ni retroceder a colonias ya recorridas. " +
-                    "Devuelve EXCLUSIVAMENTE un arreglo JSON de strings con los mismos id recibidos, sin texto extra ni markdown."
+                "Ordena las ${orderedStops.size} paradas con sentido vial y lógico de reparto: agrupa calles, privadas y colonias contiguas en un avance fluido sin saltar de un extremo a otro ni retroceder a colonias ya recorridas. " +
+                    "Devuelve EXCLUSIVAMENTE un arreglo JSON de strings con los mismos ${orderedStops.size} id recibidos, sin texto extra ni markdown."
             )
         }
 
@@ -194,34 +241,36 @@ private suspend fun orderStopsWithGemini(
             put(
                 "generationConfig",
                 JSONObject()
-                    .put("temperature", 0.2)
+                    .put("temperature", 0.1)
                     .put("responseMimeType", "application/json")
+                    .put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
             )
         }
 
-        val endpoint = URL(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${Uri.encode(apiKey.trim())}"
+        val baseUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        val payloadStr = payload.toString()
+
+        var (code, responseText) = executeGeminiPost(
+            urlString = "$baseUrl?key=${Uri.encode(cleanKey)}",
+            payloadString = payloadStr,
+            apiKeyHeader = cleanKey
         )
-        val conn = (endpoint.openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            connectTimeout = 15000
-            readTimeout = 25000
-            doOutput = true
-            setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-        }
 
-        OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
-            writer.write(payload.toString())
-            writer.flush()
+        // Si la clave empieza con AQ. y falla por autenticación en query/x-goog-api-key, reintenta como Bearer token
+        if ((code == 400 || code == 401 || code == 403) && cleanKey.startsWith("AQ.")) {
+            val retry = executeGeminiPost(
+                urlString = baseUrl,
+                payloadString = payloadStr,
+                bearerToken = cleanKey
+            )
+            if (retry.first in 200..299) {
+                code = retry.first
+                responseText = retry.second
+            }
         }
-
-        val code = conn.responseCode
-        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-        val responseText = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
-        conn.disconnect()
 
         if (code !in 200..299) {
-            return@withContext Result.failure(Exception("HTTP $code de Gemini"))
+            return@withContext Result.failure(Exception(parseGeminiApiError(code, responseText)))
         }
 
         val root = JSONObject(responseText)
@@ -240,15 +289,27 @@ private suspend fun orderStopsWithGemini(
         val returnedIds = mutableListOf<String>()
         for (i in 0 until idArray.length()) {
             val id = idArray.optString(i, "").trim()
-            if (id.isNotEmpty()) returnedIds.add(id)
+            if (id.isNotEmpty() && id !in returnedIds) returnedIds.add(id)
         }
 
-        val expectedSet = orderedStops.map { it.id }.toSet()
-        if (returnedIds.size != orderedStops.size || returnedIds.toSet() != expectedSet) {
-            return@withContext Result.failure(Exception("Respuesta incompleta o con IDs distintos"))
+        val expectedIds = orderedStops.map { it.id }
+        val expectedSet = expectedIds.toSet()
+
+        // Si Gemini devolvió todos los IDs válidos, los aplicamos directo;
+        // si omitió alguno en una lista muy larga, conservamos su orden y añadimos los faltantes al final sin perder paradas.
+        val validOrdered = returnedIds.filter { it in expectedSet }
+        if (validOrdered.isEmpty()) {
+            return@withContext Result.failure(Exception("Gemini no devolvió IDs válidos"))
         }
 
-        Result.success(returnedIds)
+        val missingIds = expectedIds.filterNot { it in validOrdered.toSet() }
+        val finalIds = validOrdered + missingIds
+
+        if (finalIds.size != orderedStops.size) {
+            return@withContext Result.failure(Exception("Recibidos ${returnedIds.size}/${orderedStops.size} IDs"))
+        }
+
+        Result.success(finalIds)
     } catch (e: Exception) {
         Result.failure(e)
     }
@@ -1115,7 +1176,7 @@ private fun RutaScreen(db: AppDatabase) {
         }
         scope.launch {
             busy = true
-            status = "Consultando sentido lógico con Gemini..."
+            status = "Ordenando ${stops.size} paradas con Gemini..."
             val ordered = stops.sortedBy { it.orderIndex }
             val gps = getLastKnownLatLng()
             val result = orderStopsWithGemini(
@@ -1135,10 +1196,10 @@ private fun RutaScreen(db: AppDatabase) {
                     db.stopDao().upsertAll(reordered)
                     status = "Orden lógico aplicado con Gemini (${reordered.size} paradas)"
                 } else {
-                    status = "No se aplicó cambio: respuesta incompleta de Gemini"
+                    status = "No se aplicó cambio: respuesta incompleta (${reordered.size}/${ordered.size})"
                 }
             }.onFailure { err ->
-                status = "Gemini no aplicado (${err.message ?: "error de red"})"
+                status = "Error Gemini: ${err.message ?: "sin conexión"}"
             }
             busy = false
         }
@@ -1499,8 +1560,8 @@ private fun RutaScreen(db: AppDatabase) {
                         text = if (busy) "Procesando..." else status,
                         modifier = Modifier.weight(1f),
                         color = TextLight,
-                        fontSize = 13.sp,
-                        maxLines = 2,
+                        fontSize = 12.sp,
+                        maxLines = 4,
                         overflow = TextOverflow.Ellipsis
                     )
                     TextButton(onClick = { runGeminiLogicalOrder() }) {
