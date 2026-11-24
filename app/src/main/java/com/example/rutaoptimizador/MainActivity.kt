@@ -19,6 +19,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -27,8 +28,10 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
@@ -39,6 +42,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Navigation
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.outlined.Circle
 import androidx.compose.material.icons.outlined.List
 import androidx.compose.material3.*
@@ -76,6 +80,8 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
+private const val APP_VERSION = "1.5.6"
+
 // Paleta Náutica Profesional (Rosa Náutica Optimizador)
 private val NavyDeep = Color(0xFF041930)
 private val NavyPanel = Color(0xFF0B192C)
@@ -88,6 +94,11 @@ private val OrangePickup = Color(0xFFEA580C)
 private val EndRed = Color(0xFFDC2626)
 private val TextLight = Color(0xFFF8FAFC)
 private val TextMutedLight = Color(0xFF94A3B8)
+
+// Centro base en Apodaca, N.L. y radios máximos para evitar saltos fuera de zona
+private val ApodacaBaseCenter = LatLng(25.7815, -100.1886)
+private const val MaxZoneRadiusMeters = 18000.0
+private const val MaxCpRadiusMeters = 4500.0
 
 object AddressExtractor {
 
@@ -604,14 +615,15 @@ private fun RutaScreen(db: AppDatabase) {
     var showMap by remember { mutableStateOf(false) }
     var showAddSheet by remember { mutableStateOf(false) }
     var showClearDialog by remember { mutableStateOf(false) }
+    var showRouteConfigDialog by remember { mutableStateOf(false) }
     var menuExpanded by remember { mutableStateOf(false) }
 
     val selectedIds = remember { mutableStateListOf<String>() }
     val selectionMode = selectedIds.isNotEmpty()
 
-    val startFromGps by remember { mutableStateOf(true) }
-    val startStopId by remember { mutableStateOf<String?>(null) }
-    val endStopId by remember { mutableStateOf<String?>(null) }
+    var startFromGps by remember { mutableStateOf(true) }
+    var startStopId by remember { mutableStateOf<String?>(null) }
+    var endStopId by remember { mutableStateOf<String?>(null) }
 
     val deliveryCount = remember(stops) { stops.count { it.type == "ENTREGA" } }
     val pickupCount = remember(stops) { stops.count { it.type == "RECOLECCION" } }
@@ -630,9 +642,8 @@ private fun RutaScreen(db: AppDatabase) {
         )
     }
 
-    val defaultCenter = LatLng(25.7815, -100.1886)
     val cameraPositionState = rememberCameraPositionState {
-        position = CameraPosition.fromLatLngZoom(defaultCenter, 12f)
+        position = CameraPosition.fromLatLngZoom(ApodacaBaseCenter, 12f)
     }
 
     fun getLastKnownLatLng(): LatLng? {
@@ -646,6 +657,10 @@ private fun RutaScreen(db: AppDatabase) {
         } catch (_: Exception) {
             null
         }
+    }
+
+    fun isWithinZone(point: LatLng, anchor: LatLng, maxMeters: Double): Boolean {
+        return haversineMeters(point.latitude, point.longitude, anchor.latitude, anchor.longitude) <= maxMeters
     }
 
     fun extractPostalCode(text: String): String? {
@@ -675,13 +690,19 @@ private fun RutaScreen(db: AppDatabase) {
             val geocoder = Geocoder(context, Locale("es", "MX"))
             val cleanForSearch = sanitizeAddressForGeocoding(rawAddress)
             val postalCode = extractPostalCode(cleanForSearch) ?: extractPostalCode(rawAddress)
+            val zoneAnchor = getLastKnownLatLng() ?: ApodacaBaseCenter
 
             var cpCenter: LatLng? = null
             if (postalCode != null) {
                 @Suppress("DEPRECATION")
-                val cpResults = geocoder.getFromLocationName("$postalCode, Apodaca, Nuevo León, México", 1)
-                cpCenter = cpResults?.firstOrNull()?.let { LatLng(it.latitude, it.longitude) }
+                val cpResults = geocoder.getFromLocationName("$postalCode, Apodaca, Nuevo León, México", 3)
+                cpCenter = cpResults
+                    ?.map { LatLng(it.latitude, it.longitude) }
+                    ?.firstOrNull { isWithinZone(it, zoneAnchor, MaxZoneRadiusMeters) }
             }
+
+            val searchAnchor = cpCenter ?: zoneAnchor
+            val maxAllowedMeters = if (cpCenter != null) MaxCpRadiusMeters else MaxZoneRadiusMeters
 
             val query = when {
                 postalCode != null && !cleanForSearch.contains("México", ignoreCase = true) ->
@@ -693,15 +714,47 @@ private fun RutaScreen(db: AppDatabase) {
             }
 
             @Suppress("DEPRECATION")
-            val results = geocoder.getFromLocationName(query, 3)
-            val chosen = results?.firstOrNull() ?: run {
-                @Suppress("DEPRECATION")
-                geocoder.getFromLocationName(rawAddress, 1)?.firstOrNull()
-            }
-            chosen?.let { LatLng(it.latitude, it.longitude) } ?: cpCenter
+            val results = geocoder.getFromLocationName(query, 5)
+            val validCandidate = results
+                ?.map { LatLng(it.latitude, it.longitude) }
+                ?.firstOrNull { isWithinZone(it, searchAnchor, maxAllowedMeters) }
+
+            validCandidate ?: cpCenter
         } catch (_: Exception) {
             null
         }
+    }
+
+    suspend fun runOptimization(
+        fromGps: Boolean,
+        startId: String?,
+        endId: String?
+    ) {
+        busy = true
+        val gps = getLastKnownLatLng()
+        val withCoords = stops.filter { it.latitude != null && it.longitude != null }
+        if (withCoords.isNotEmpty()) {
+            val optimized = optimizeStopsRoute(
+                stopsWithCoords = withCoords,
+                startFromCurrentGps = fromGps,
+                currentLatLng = gps,
+                fixedStartId = startId,
+                fixedEndId = endId
+            )
+            db.stopDao().upsertAll(optimized)
+            val originLabel = when {
+                fromGps && gps != null -> "desde GPS"
+                startId != null -> {
+                    val idx = stops.indexOfFirst { it.id == startId }
+                    if (idx >= 0) "desde #${idx + 1}" else "optimizada"
+                }
+                else -> "optimizada"
+            }
+            status = "Ruta optimizada $originLabel (${optimized.size} paradas)"
+        } else {
+            status = "Sin coordenadas para optimizar"
+        }
+        busy = false
     }
 
     fun processScreenshotUris(uris: List<Uri>) {
@@ -856,12 +909,31 @@ private fun RutaScreen(db: AppDatabase) {
                         actionIconContentColor = TextLight
                     ),
                     title = {
-                        Text(
-                            text = if (showMap) "Mapa de Ruta" else "Paradas (${stops.size})",
-                            fontWeight = FontWeight.Bold
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = if (showMap) "Mapa de Ruta" else "Paradas (${stops.size})",
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = NauticalTeal.copy(alpha = 0.2f),
+                                border = BorderStroke(1.dp, NauticalTeal)
+                            ) {
+                                Text(
+                                    text = "v$APP_VERSION",
+                                    color = NauticalTeal,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
                     },
                     actions = {
+                        IconButton(onClick = { showRouteConfigDialog = true }) {
+                            Icon(Icons.Default.Tune, contentDescription = "Inicio y fin de ruta")
+                        }
                         IconButton(
                             onClick = {
                                 multiPhotoPicker.launch(
@@ -886,6 +958,14 @@ private fun RutaScreen(db: AppDatabase) {
                             containerColor = NavyCard
                         ) {
                             DropdownMenuItem(
+                                text = { Text("Inicio y fin de ruta", color = TextLight) },
+                                leadingIcon = { Icon(Icons.Default.Tune, contentDescription = null, tint = NauticalTeal) },
+                                onClick = {
+                                    menuExpanded = false
+                                    showRouteConfigDialog = true
+                                }
+                            )
+                            DropdownMenuItem(
                                 text = { Text("Cargar capturas (OCR)", color = TextLight) },
                                 leadingIcon = { Icon(Icons.Default.Image, contentDescription = null, tint = NauticalTeal) },
                                 onClick = {
@@ -901,23 +981,7 @@ private fun RutaScreen(db: AppDatabase) {
                                 onClick = {
                                     menuExpanded = false
                                     scope.launch {
-                                        busy = true
-                                        val gps = getLastKnownLatLng()
-                                        val withCoords = stops.filter { it.latitude != null && it.longitude != null }
-                                        if (withCoords.isNotEmpty()) {
-                                            val optimized = optimizeStopsRoute(
-                                                stopsWithCoords = withCoords,
-                                                startFromCurrentGps = startFromGps,
-                                                currentLatLng = gps,
-                                                fixedStartId = startStopId,
-                                                fixedEndId = endStopId
-                                            )
-                                            db.stopDao().upsertAll(optimized)
-                                            status = "Ruta optimizada (${optimized.size} paradas)"
-                                        } else {
-                                            status = "Sin coordenadas para optimizar"
-                                        }
-                                        busy = false
+                                        runOptimization(startFromGps, startStopId, endStopId)
                                     }
                                 }
                             )
@@ -968,7 +1032,6 @@ private fun RutaScreen(db: AppDatabase) {
                 .background(NavyDeep)
                 .padding(padding)
         ) {
-            // Paneles superiores de resumen (Entregas, Recolecciones y Cobros)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1030,6 +1093,9 @@ private fun RutaScreen(db: AppDatabase) {
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
+                    TextButton(onClick = { showRouteConfigDialog = true }) {
+                        Text("Inicio/Fin", color = NauticalMint, fontWeight = FontWeight.Bold)
+                    }
                     TextButton(
                         onClick = {
                             multiPhotoPicker.launch(
@@ -1144,6 +1210,124 @@ private fun RutaScreen(db: AppDatabase) {
             }
         }
 
+        if (showRouteConfigDialog) {
+            AlertDialog(
+                onDismissRequest = { showRouteConfigDialog = false },
+                containerColor = NavyCard,
+                titleContentColor = TextLight,
+                textContentColor = TextLight,
+                title = { Text("Inicio y fin de ruta", fontWeight = FontWeight.Bold) },
+                text = {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Text("Punto de inicio", fontWeight = FontWeight.SemiBold, color = NauticalTeal)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    startFromGps = true
+                                    startStopId = null
+                                },
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = startFromGps,
+                                onClick = {
+                                    startFromGps = true
+                                    startStopId = null
+                                }
+                            )
+                            Text("Mi ubicación actual (GPS)", color = TextLight)
+                        }
+
+                        stops.forEachIndexed { idx, stop ->
+                            val isChosenStart = !startFromGps && startStopId == stop.id
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        startFromGps = false
+                                        startStopId = stop.id
+                                    },
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(
+                                    selected = isChosenStart,
+                                    onClick = {
+                                        startFromGps = false
+                                        startStopId = stop.id
+                                    }
+                                )
+                                Text(
+                                    text = "#${idx + 1} · ${stop.address}",
+                                    color = TextLight,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+
+                        HorizontalDivider(color = NavyBorder)
+                        Text("Parada final (opcional)", fontWeight = FontWeight.SemiBold, color = GoldCobro)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { endStopId = null },
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = endStopId == null,
+                                onClick = { endStopId = null }
+                            )
+                            Text("Sin parada final fija", color = TextLight)
+                        }
+
+                        stops.forEachIndexed { idx, stop ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { endStopId = stop.id },
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(
+                                    selected = endStopId == stop.id,
+                                    onClick = { endStopId = stop.id }
+                                )
+                                Text(
+                                    text = "#${idx + 1} · ${stop.address}",
+                                    color = TextLight,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            showRouteConfigDialog = false
+                            scope.launch {
+                                runOptimization(startFromGps, startStopId, endStopId)
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = NauticalTeal)
+                    ) {
+                        Text("Optimizar ahora", color = Color.White)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showRouteConfigDialog = false }) {
+                        Text("Cerrar", color = TextLight)
+                    }
+                }
+            )
+        }
+
         if (showAddSheet) {
             ModalBottomSheet(
                 onDismissRequest = { showAddSheet = false },
@@ -1255,6 +1439,8 @@ private fun RutaScreen(db: AppDatabase) {
                                 stops.forEach { stop -> db.stopDao().delete(stop.id) }
                                 selectedIds.clear()
                                 activeFilter = null
+                                startStopId = null
+                                endStopId = null
                                 showClearDialog = false
                                 status = "Ruta limpiada"
                             }
