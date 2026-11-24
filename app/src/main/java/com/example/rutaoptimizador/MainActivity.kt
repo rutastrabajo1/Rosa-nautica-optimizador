@@ -35,6 +35,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -43,6 +44,7 @@ import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.FormatListNumbered
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Navigation
@@ -60,6 +62,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -87,7 +90,7 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-private const val APP_VERSION = "1.6.2"
+private const val APP_VERSION = "1.6.3"
 
 // Paleta Náutica Profesional (Rosa Náutica Optimizador)
 private val NavyDeep = Color(0xFF041930)
@@ -471,14 +474,17 @@ private fun haversineMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Doub
 }
 
 private fun streetClusterKey(stop: Stop): String {
-    val firstPart = stop.address.split(",")
-        .firstOrNull()
-        ?.lowercase(Locale("es", "MX"))
-        ?.replace(Regex("""\b\d+\b"""), "")
-        ?.replace(Regex("""\s+"""), " ")
-        ?.trim()
-        .orEmpty()
-    return if (firstPart.isNotBlank()) firstPart else stop.id
+    val parts = stop.address.split(",")
+        .map { part ->
+            part.lowercase(Locale("es", "MX"))
+                .replace(Regex("""\b\d+\b"""), "")
+                .replace(Regex("""\s+"""), " ")
+                .trim()
+        }
+        .filter { it.isNotBlank() }
+    val street = parts.firstOrNull().orEmpty()
+    val colonia = parts.getOrNull(1).orEmpty()
+    return if (street.isNotBlank() || colonia.isNotBlank()) "$street|$colonia" else stop.id
 }
 
 private fun optimizeStopsRoute(
@@ -534,13 +540,16 @@ private fun optimizeStopsRoute(
             if (!respectStreetSequence) {
                 dist
             } else {
-                val sameStreetBonus = if (streetClusterKey(candidate) == currentAnchorKey && dist < 400.0) {
-                    0.55
-                } else {
-                    1.0
+                val candKey = streetClusterKey(candidate)
+                val sameCluster = candKey == currentAnchorKey
+                val clusterMultiplier = when {
+                    sameCluster && dist < 800.0 -> 0.45
+                    sameCluster -> 0.72
+                    dist < 300.0 -> 0.95
+                    else -> 1.35
                 }
-                val sequenceBias = 1.0 + (i.toDouble() / (middlePool.size + 1).toDouble()) * 0.12
-                dist * sameStreetBonus * sequenceBias
+                val sequenceBias = 1.0 + (i.toDouble() / (middlePool.size + 1).toDouble()) * 0.25
+                dist * clusterMultiplier * sequenceBias
             }
         } ?: 0
 
@@ -558,24 +567,18 @@ private fun optimizeStopsRoute(
     val lockEnd = endStop != null
     val optFrom = if (lockStart) 1 else 0
     val optTo = if (lockEnd) route.size - 2 else route.size - 1
-    val improvementThresholdMeters = if (respectStreetSequence) 180.0 else 15.0
+    val improvementThresholdMeters = if (respectStreetSequence) 450.0 else 15.0
 
     if (optTo - optFrom >= 2) {
         var improved = true
         var passes = 0
-        while (improved && passes < 10) {
+        while (improved && passes < 8) {
             improved = false
             passes++
             for (i in optFrom until optTo) {
                 for (k in i + 1..optTo) {
-                    if (respectStreetSequence && k == i + 1) {
-                        val adjacentDist = haversineMeters(
-                            route[i].latitude!!,
-                            route[i].longitude!!,
-                            route[k].latitude!!,
-                            route[k].longitude!!
-                        )
-                        if (adjacentDist < 250.0) continue
+                    if (respectStreetSequence && streetClusterKey(route[i]) == streetClusterKey(route[k])) {
+                        continue
                     }
 
                     val prevLat = if (i == 0 && startFromCurrentGps && currentLatLng != null) {
@@ -767,6 +770,8 @@ private fun RutaScreen(db: AppDatabase) {
     var showAddSheet by remember { mutableStateOf(false) }
     var showClearDialog by remember { mutableStateOf(false) }
     var showRouteConfigDialog by remember { mutableStateOf(false) }
+    var showPositionDialog by remember { mutableStateOf(false) }
+    var targetPositionInput by remember { mutableStateOf("1") }
     var menuExpanded by remember { mutableStateOf(false) }
 
     val selectedIds = remember { mutableStateListOf<String>() }
@@ -872,15 +877,12 @@ private fun RutaScreen(db: AppDatabase) {
 
             @Suppress("DEPRECATION")
             val results = geocoder.getFromLocationName(query, 5)
-            val validSpecificCandidate = results
+            results
                 ?.firstOrNull { addr ->
                     val pt = LatLng(addr.latitude, addr.longitude)
                     isWithinZone(pt, searchAnchor, maxAllowedMeters) && isSpecificAddressMatch(addr, postalCode)
                 }
                 ?.let { LatLng(it.latitude, it.longitude) }
-
-            // No cae al centro de Apodaca ni a centroides genéricos si no hay coincidencia específica
-            validSpecificCandidate
         } catch (_: Exception) {
             null
         }
@@ -910,6 +912,29 @@ private fun RutaScreen(db: AppDatabase) {
             val reindexed = ordered.mapIndexed { idx, s -> s.copy(orderIndex = idx) }
             db.stopDao().upsertAll(reindexed)
             status = "Parada movida a posición #${targetIdx + 1}"
+        }
+    }
+
+    fun moveSelectedToExactPosition(targetNumberOneBased: Int) {
+        if (busy || selectedIds.isEmpty() || stops.isEmpty()) return
+        scope.launch {
+            val ordered = stops.sortedBy { it.orderIndex }.toMutableList()
+            val selectedSet = selectedIds.toSet()
+            val movingItems = ordered.filter { it.id in selectedSet }
+            val remainingItems = ordered.filterNot { it.id in selectedSet }
+            if (movingItems.isEmpty()) return@launch
+
+            val insertIdx = (targetNumberOneBased - 1).coerceIn(0, remainingItems.size)
+            remainingItems.addAll(insertIdx, movingItems)
+            val reindexed = remainingItems.mapIndexed { idx, s -> s.copy(orderIndex = idx) }
+            db.stopDao().upsertAll(reindexed)
+            val finalPos = insertIdx + 1
+            selectedIds.clear()
+            status = if (movingItems.size == 1) {
+                "Parada asignada al número #$finalPos"
+            } else {
+                "${movingItems.size} paradas movidas a partir del #$finalPos"
+            }
         }
     }
 
@@ -1093,11 +1118,27 @@ private fun RutaScreen(db: AppDatabase) {
                     },
                     title = {
                         Text(
-                            text = "${selectedIds.size} seleccionada(s)",
+                            text = "${selectedIds.size} sel.",
                             fontWeight = FontWeight.Bold
                         )
                     },
                     actions = {
+                        TextButton(
+                            onClick = {
+                                val currentIdx = stops.indexOfFirst { it.id == selectedIds.firstOrNull() }
+                                targetPositionInput = if (currentIdx >= 0) "${currentIdx + 1}" else "1"
+                                showPositionDialog = true
+                            }
+                        ) {
+                            Icon(
+                                Icons.Default.FormatListNumbered,
+                                contentDescription = null,
+                                tint = GoldCobro,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("# Pos", color = GoldCobro, fontWeight = FontWeight.Bold)
+                        }
                         IconButton(onClick = { moveSelectedStops(-1) }) {
                             Icon(Icons.Default.ArrowUpward, contentDescription = "Subir parada", tint = NauticalMint)
                         }
@@ -1445,6 +1486,59 @@ private fun RutaScreen(db: AppDatabase) {
                     }
                 }
             }
+        }
+
+        if (showPositionDialog) {
+            AlertDialog(
+                onDismissRequest = { showPositionDialog = false },
+                containerColor = NavyCard,
+                titleContentColor = TextLight,
+                textContentColor = TextLight,
+                title = { Text("Asignar número de parada", fontWeight = FontWeight.Bold) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(
+                            text = "Escribe el número (1 a ${stops.size.coerceAtLeast(1)}) para mover la selección directo a ese lugar:",
+                            color = TextMutedLight,
+                            fontSize = 13.sp
+                        )
+                        OutlinedTextField(
+                            value = targetPositionInput,
+                            onValueChange = { raw ->
+                                targetPositionInput = raw.filter { it.isDigit() }
+                            },
+                            label = { Text("Número de parada", color = TextMutedLight) },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = TextLight,
+                                unfocusedTextColor = TextLight,
+                                focusedBorderColor = GoldCobro,
+                                unfocusedBorderColor = NavyBorder
+                            )
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            val num = targetPositionInput.toIntOrNull()
+                            showPositionDialog = false
+                            if (num != null && num >= 1) {
+                                moveSelectedToExactPosition(num)
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = GoldCobro)
+                    ) {
+                        Text("Mover al #", color = NavyDeep, fontWeight = FontWeight.Bold)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showPositionDialog = false }) {
+                        Text("Cancelar", color = TextLight)
+                    }
+                }
+            )
         }
 
         if (showRouteConfigDialog) {
