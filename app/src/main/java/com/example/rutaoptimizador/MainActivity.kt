@@ -9,6 +9,8 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.RectF
+import android.location.Geocoder
+import android.location.LocationManager
 import android.net.Uri
 import android.os.Bundle
 import android.widget.VideoView
@@ -70,6 +72,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import java.util.Locale
 import java.util.UUID
 import kotlin.coroutines.resume
 import kotlin.math.atan2
@@ -77,7 +80,7 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-private const val APP_VERSION = "1.5.7"
+private const val APP_VERSION = "1.5.8"
 
 // Paleta Náutica Profesional (Rosa Náutica Optimizador)
 private val NavyDeep = Color(0xFF041930)
@@ -92,8 +95,10 @@ private val EndRed = Color(0xFFDC2626)
 private val TextLight = Color(0xFFF8FAFC)
 private val TextMutedLight = Color(0xFF94A3B8)
 
-// Centro base en Apodaca, N.L.
+// Centro base en Apodaca, N.L. y radios máximos para evitar saltos fuera de zona
 private val ApodacaBaseCenter = LatLng(25.7815, -100.1886)
+private const val MaxZoneRadiusMeters = 18000.0
+private const val MaxCpRadiusMeters = 4500.0
 
 private fun buildGoogleMapsSearchUrl(address: String, lat: Double? = null, lng: Double? = null): String {
     val query = if (lat != null && lng != null) {
@@ -222,12 +227,46 @@ object AddressExtractor {
 fun SplashVideoScreen(
     onFinished: () -> Unit
 ) {
+    val context = LocalContext.current
     var hasFinished by remember { mutableStateOf(false) }
+    var isStarted by remember { mutableStateOf(false) }
 
     fun finishOnce() {
         if (!hasFinished) {
             hasFinished = true
             onFinished()
+        }
+    }
+
+    val videoView = remember(context) {
+        VideoView(context).apply {
+            val uri = Uri.parse("android.resource://${context.packageName}/${R.raw.splash_rosa_nautica}")
+            setVideoURI(uri)
+            setOnPreparedListener { mediaPlayer ->
+                mediaPlayer.isLooping = false
+                mediaPlayer.setOnInfoListener { _, _, _ -> false }
+                if (!isStarted && !hasFinished) {
+                    isStarted = true
+                    start()
+                }
+            }
+            setOnCompletionListener {
+                stopPlayback()
+                finishOnce()
+            }
+            setOnErrorListener { _, _, _ ->
+                finishOnce()
+                true
+            }
+        }
+    }
+
+    DisposableEffect(videoView) {
+        onDispose {
+            try {
+                videoView.stopPlayback()
+            } catch (_: Exception) {
+            }
         }
     }
 
@@ -239,23 +278,7 @@ fun SplashVideoScreen(
     ) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
-            factory = { ctx ->
-                VideoView(ctx).apply {
-                    val uri = Uri.parse("android.resource://${ctx.packageName}/${R.raw.splash_rosa_nautica}")
-                    setVideoURI(uri)
-                    setOnPreparedListener { mediaPlayer ->
-                        mediaPlayer.isLooping = false
-                        start()
-                    }
-                    setOnCompletionListener {
-                        finishOnce()
-                    }
-                    setOnErrorListener { _, _, _ ->
-                        finishOnce()
-                        true
-                    }
-                }
-            }
+            factory = { videoView }
         )
     }
 }
@@ -385,27 +408,158 @@ private fun haversineMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Doub
     return r * c
 }
 
-private fun preserveOrderWithStartEnd(
-    allStops: List<Stop>,
+private fun streetClusterKey(stop: Stop): String {
+    val firstPart = stop.address.split(",")
+        .firstOrNull()
+        ?.lowercase(Locale("es", "MX"))
+        ?.replace(Regex("""\b\d+\b"""), "")
+        ?.replace(Regex("""\s+"""), " ")
+        ?.trim()
+        .orEmpty()
+    return if (firstPart.isNotBlank()) firstPart else stop.id
+}
+
+private fun optimizeStopsRoute(
+    stopsWithCoords: List<Stop>,
+    startFromCurrentGps: Boolean,
+    currentLatLng: LatLng?,
     fixedStartId: String?,
-    fixedEndId: String?
+    fixedEndId: String?,
+    respectStreetSequence: Boolean = true
 ): List<Stop> {
-    val ordered = allStops.sortedBy { it.orderIndex }.toMutableList()
-    if (ordered.size <= 1) return ordered.mapIndexed { idx, s -> s.copy(orderIndex = idx) }
+    if (stopsWithCoords.size <= 1) return stopsWithCoords
 
-    val startItem = fixedStartId?.let { id -> ordered.firstOrNull { it.id == id } }
-    if (startItem != null) {
-        ordered.removeAll { it.id == startItem.id }
-        ordered.add(0, startItem)
+    val orderedInput = stopsWithCoords.sortedBy { it.orderIndex }
+    val endStop = fixedEndId?.let { id -> orderedInput.firstOrNull { it.id == id } }
+    val startStop = if (!startFromCurrentGps) {
+        fixedStartId?.let { id ->
+            orderedInput.firstOrNull { it.id == id && it.id != endStop?.id }
+        }
+    } else null
+
+    val middlePool = orderedInput.filter {
+        it.id != startStop?.id && it.id != endStop?.id
+    }.toMutableList()
+
+    val route = mutableListOf<Stop>()
+    var anchorLat: Double
+    var anchorLng: Double
+
+    if (startFromCurrentGps && currentLatLng != null) {
+        anchorLat = currentLatLng.latitude
+        anchorLng = currentLatLng.longitude
+    } else if (startStop != null) {
+        route.add(startStop)
+        anchorLat = startStop.latitude!!
+        anchorLng = startStop.longitude!!
+    } else {
+        val first = middlePool.removeAt(0)
+        route.add(first)
+        anchorLat = first.latitude!!
+        anchorLng = first.longitude!!
     }
 
-    val endItem = fixedEndId?.let { id -> ordered.firstOrNull { it.id == id && it.id != startItem?.id } }
-    if (endItem != null) {
-        ordered.removeAll { it.id == endItem.id }
-        ordered.add(endItem)
+    while (middlePool.isNotEmpty()) {
+        val currentAnchorKey = route.lastOrNull()?.let { streetClusterKey(it) } ?: ""
+        val nextIdx = middlePool.indices.minByOrNull { i ->
+            val candidate = middlePool[i]
+            val dist = haversineMeters(
+                anchorLat,
+                anchorLng,
+                candidate.latitude!!,
+                candidate.longitude!!
+            )
+            if (!respectStreetSequence) {
+                dist
+            } else {
+                val sameStreetBonus = if (streetClusterKey(candidate) == currentAnchorKey && dist < 400.0) {
+                    0.55
+                } else {
+                    1.0
+                }
+                val sequenceBias = 1.0 + (i.toDouble() / (middlePool.size + 1).toDouble()) * 0.12
+                dist * sameStreetBonus * sequenceBias
+            }
+        } ?: 0
+
+        val chosen = middlePool.removeAt(nextIdx)
+        route.add(chosen)
+        anchorLat = chosen.latitude!!
+        anchorLng = chosen.longitude!!
     }
 
-    return ordered.mapIndexed { idx, stop -> stop.copy(orderIndex = idx) }
+    if (endStop != null) {
+        route.add(endStop)
+    }
+
+    val lockStart = startStop != null
+    val lockEnd = endStop != null
+    val optFrom = if (lockStart) 1 else 0
+    val optTo = if (lockEnd) route.size - 2 else route.size - 1
+    val improvementThresholdMeters = if (respectStreetSequence) 180.0 else 15.0
+
+    if (optTo - optFrom >= 2) {
+        var improved = true
+        var passes = 0
+        while (improved && passes < 10) {
+            improved = false
+            passes++
+            for (i in optFrom until optTo) {
+                for (k in i + 1..optTo) {
+                    if (respectStreetSequence && k == i + 1) {
+                        val adjacentDist = haversineMeters(
+                            route[i].latitude!!,
+                            route[i].longitude!!,
+                            route[k].latitude!!,
+                            route[k].longitude!!
+                        )
+                        if (adjacentDist < 250.0) continue
+                    }
+
+                    val prevLat = if (i == 0 && startFromCurrentGps && currentLatLng != null) {
+                        currentLatLng.latitude
+                    } else if (i > 0) {
+                        route[i - 1].latitude!!
+                    } else null
+
+                    val prevLng = if (i == 0 && startFromCurrentGps && currentLatLng != null) {
+                        currentLatLng.longitude
+                    } else if (i > 0) {
+                        route[i - 1].longitude!!
+                    } else null
+
+                    val nextLat = if (k + 1 < route.size) route[k + 1].latitude!! else null
+                    val nextLng = if (k + 1 < route.size) route[k + 1].longitude!! else null
+
+                    val currentEdgeCost =
+                        (if (prevLat != null && prevLng != null) {
+                            haversineMeters(prevLat, prevLng, route[i].latitude!!, route[i].longitude!!)
+                        } else 0.0) +
+                            (if (nextLat != null && nextLng != null) {
+                                haversineMeters(route[k].latitude!!, route[k].longitude!!, nextLat, nextLng)
+                            } else 0.0)
+
+                    val swappedEdgeCost =
+                        (if (prevLat != null && prevLng != null) {
+                            haversineMeters(prevLat, prevLng, route[k].latitude!!, route[k].longitude!!)
+                        } else 0.0) +
+                            (if (nextLat != null && nextLng != null) {
+                                haversineMeters(route[i].latitude!!, route[i].longitude!!, nextLat, nextLng)
+                            } else 0.0)
+
+                    if (swappedEdgeCost + improvementThresholdMeters < currentEdgeCost) {
+                        val sub = route.subList(i, k + 1).reversed()
+                        for (offset in sub.indices) {
+                            route[i + offset] = sub[offset]
+                        }
+                        improved = true
+                    }
+                }
+            }
+        }
+    }
+
+    return route.mapIndexed { idx, stop -> stop.copy(orderIndex = idx) }
 }
 
 private suspend fun recognizeTextFromUri(context: android.content.Context, uri: Uri): String =
@@ -556,6 +710,7 @@ private fun RutaScreen(db: AppDatabase) {
     val selectedIds = remember { mutableStateListOf<String>() }
     val selectionMode = selectedIds.isNotEmpty()
 
+    var startFromGps by remember { mutableStateOf(true) }
     var keepStreetSequence by remember { mutableStateOf(true) }
     var startStopId by remember { mutableStateOf<String?>(null) }
     var endStopId by remember { mutableStateOf<String?>(null) }
@@ -581,6 +736,78 @@ private fun RutaScreen(db: AppDatabase) {
         position = CameraPosition.fromLatLngZoom(ApodacaBaseCenter, 12f)
     }
 
+    fun getLastKnownLatLng(): LatLng? {
+        if (!hasLocationPermission) return null
+        return try {
+            val lm = context.getSystemService(LocationManager::class.java)
+            val gpsLoc = lm?.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+            val netLoc = lm?.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+            val best = gpsLoc ?: netLoc
+            best?.let { LatLng(it.latitude, it.longitude) }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun isWithinZone(point: LatLng, anchor: LatLng, maxMeters: Double): Boolean {
+        return haversineMeters(point.latitude, point.longitude, anchor.latitude, anchor.longitude) <= maxMeters
+    }
+
+    fun extractPostalCode(text: String): String? {
+        val cpRegex = Regex("""\b(\d{5})\b""")
+        return cpRegex.findAll(text)
+            .map { it.groupValues[1] }
+            .firstOrNull { it.toIntOrNull() in 1000..99999 }
+    }
+
+    fun sanitizeAddressForGeocoding(raw: String): String {
+        val parts = raw.split(",")
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+        return if (parts.isNotEmpty()) parts.joinToString(", ") else raw.trim()
+    }
+
+    suspend fun geocodeAddress(rawAddress: String): LatLng? = withContext(Dispatchers.IO) {
+        try {
+            val geocoder = Geocoder(context, Locale("es", "MX"))
+            val cleanForSearch = sanitizeAddressForGeocoding(rawAddress)
+            val postalCode = extractPostalCode(cleanForSearch) ?: extractPostalCode(rawAddress)
+            val zoneAnchor = getLastKnownLatLng() ?: ApodacaBaseCenter
+
+            var cpCenter: LatLng? = null
+            if (postalCode != null) {
+                @Suppress("DEPRECATION")
+                val cpResults = geocoder.getFromLocationName("$postalCode, Apodaca, Nuevo León, México", 3)
+                cpCenter = cpResults
+                    ?.map { LatLng(it.latitude, it.longitude) }
+                    ?.firstOrNull { isWithinZone(it, zoneAnchor, MaxZoneRadiusMeters) }
+            }
+
+            val searchAnchor = cpCenter ?: zoneAnchor
+            val maxAllowedMeters = if (cpCenter != null) MaxCpRadiusMeters else MaxZoneRadiusMeters
+
+            val query = when {
+                postalCode != null && !cleanForSearch.contains("México", ignoreCase = true) ->
+                    "$cleanForSearch, CP $postalCode, Apodaca, Nuevo León, México"
+                cleanForSearch.contains("Nuevo León", ignoreCase = true) ||
+                    cleanForSearch.contains("México", ignoreCase = true) ->
+                    cleanForSearch
+                else -> "$cleanForSearch, Apodaca, Nuevo León, México"
+            }
+
+            @Suppress("DEPRECATION")
+            val results = geocoder.getFromLocationName(query, 5)
+            val validCandidate = results
+                ?.map { LatLng(it.latitude, it.longitude) }
+                ?.firstOrNull { isWithinZone(it, searchAnchor, maxAllowedMeters) }
+
+            validCandidate ?: cpCenter
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     fun openGoogleMapsForStop(stop: Stop) {
         val mapsUrl = buildGoogleMapsSearchUrl(
             address = stop.address,
@@ -591,22 +818,39 @@ private fun RutaScreen(db: AppDatabase) {
         context.startActivity(intent)
     }
 
-    suspend fun applyRouteOrder(
+    suspend fun runOptimization(
+        fromGps: Boolean,
         startId: String?,
         endId: String?,
         respectSequence: Boolean
     ) {
         busy = true
-        if (stops.isNotEmpty()) {
-            val ordered = if (respectSequence) {
-                preserveOrderWithStartEnd(stops, startId, endId)
-            } else {
-                preserveOrderWithStartEnd(stops, startId, endId)
+        val gps = getLastKnownLatLng()
+        val withCoords = stops.filter { it.latitude != null && it.longitude != null }
+        if (withCoords.isNotEmpty()) {
+            val optimized = optimizeStopsRoute(
+                stopsWithCoords = withCoords,
+                startFromCurrentGps = fromGps,
+                currentLatLng = gps,
+                fixedStartId = startId,
+                fixedEndId = endId,
+                respectStreetSequence = respectSequence
+            )
+            val withoutCoords = stops.filter { it.latitude == null || it.longitude == null }
+                .sortedBy { it.orderIndex }
+            val merged = (optimized + withoutCoords).mapIndexed { idx, s -> s.copy(orderIndex = idx) }
+            db.stopDao().upsertAll(merged)
+            val originLabel = when {
+                fromGps && gps != null -> "desde GPS"
+                startId != null -> {
+                    val idx = stops.indexOfFirst { it.id == startId }
+                    if (idx >= 0) "desde #${idx + 1}" else "optimizada"
+                }
+                else -> "optimizada"
             }
-            db.stopDao().upsertAll(ordered)
-            status = "Orden de calles conservado (${ordered.size} paradas)"
+            status = "Ruta optimizada $originLabel (${optimized.size} con GPS)"
         } else {
-            status = "Sin paradas en la ruta"
+            status = "Sin coordenadas para optimizar"
         }
         busy = false
     }
@@ -623,10 +867,11 @@ private fun RutaScreen(db: AppDatabase) {
                 val rawText = recognizeTextFromUri(context, uri)
                 val extracted = AddressExtractor.candidates(rawText)
                 for (candidate in extracted) {
+                    val coords = geocodeAddress(candidate.address)
                     val stopToSave = candidate.copy(
-                        latitude = null,
-                        longitude = null,
-                        verified = false,
+                        latitude = coords?.latitude,
+                        longitude = coords?.longitude,
+                        verified = coords != null,
                         orderIndex = nextIndex++
                     )
                     db.stopDao().upsert(stopToSave)
@@ -635,9 +880,9 @@ private fun RutaScreen(db: AppDatabase) {
             }
 
             status = if (addedCount > 0) {
-                "Se agregaron $addedCount domicilio(s) desde capturas"
+                "Se agregaron $addedCount parada(s) desde capturas"
             } else {
-                "No se detectaron domicilios claros en las capturas"
+                "No se detectaron direcciones válidas en las capturas"
             }
             busy = false
         }
@@ -668,12 +913,23 @@ private fun RutaScreen(db: AppDatabase) {
         scope.launch {
             busy = true
             val selectedSet = selectedIds.toSet()
-            val selectedItems = stops.filter { it.id in selectedSet }.sortedBy { it.orderIndex }
-            val remainingItems = stops.filterNot { it.id in selectedSet }.sortedBy { it.orderIndex }
-            val merged = (remainingItems + selectedItems).mapIndexed { idx, s -> s.copy(orderIndex = idx) }
+            val selectedItems = stops.filter { it.id in selectedSet }
+            val remainingItems = stops.filterNot { it.id in selectedSet }
+
+            val anchor = selectedItems.firstOrNull { it.latitude != null && it.longitude != null }
+            val orderedGroup = if (anchor != null) {
+                val withCoords = selectedItems.filter { it.latitude != null && it.longitude != null }
+                    .sortedBy { haversineMeters(anchor.latitude!!, anchor.longitude!!, it.latitude!!, it.longitude!!) }
+                val withoutCoords = selectedItems.filter { it.latitude == null || it.longitude == null }
+                withCoords + withoutCoords
+            } else {
+                selectedItems
+            }
+
+            val merged = (remainingItems + orderedGroup).mapIndexed { idx, s -> s.copy(orderIndex = idx) }
             db.stopDao().upsertAll(merged)
             selectedIds.clear()
-            status = "Grupo de ${selectedItems.size} parada(s) reunido en secuencia"
+            status = "Grupo de ${orderedGroup.size} parada(s) reunido en secuencia"
             busy = false
         }
     }
@@ -802,12 +1058,12 @@ private fun RutaScreen(db: AppDatabase) {
                                 }
                             )
                             DropdownMenuItem(
-                                text = { Text("Aplicar orden de calles", color = TextLight) },
+                                text = { Text("Optimizar ruta", color = TextLight) },
                                 leadingIcon = { Icon(Icons.Default.Refresh, contentDescription = null, tint = NauticalMint) },
                                 onClick = {
                                     menuExpanded = false
                                     scope.launch {
-                                        applyRouteOrder(startStopId, endStopId, keepStreetSequence)
+                                        runOptimization(startFromGps, startStopId, endStopId, keepStreetSequence)
                                     }
                                 }
                             )
@@ -1010,7 +1266,7 @@ private fun RutaScreen(db: AppDatabase) {
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     Text(
-                                        text = "${stop.type} · Enlace Google Maps listo",
+                                        text = "${stop.type} · ${if (stop.verified) "GPS listo" else "Enlace Google Maps listo"}",
                                         color = TextMutedLight,
                                         fontSize = 12.sp
                                     )
@@ -1042,7 +1298,7 @@ private fun RutaScreen(db: AppDatabase) {
                 containerColor = NavyCard,
                 titleContentColor = TextLight,
                 textContentColor = TextLight,
-                title = { Text("Orden, inicio y fin de ruta", fontWeight = FontWeight.Bold) },
+                title = { Text("Inicio y fin de ruta", fontWeight = FontWeight.Bold) },
                 text = {
                     Column(
                         modifier = Modifier
@@ -1063,30 +1319,43 @@ private fun RutaScreen(db: AppDatabase) {
                         }
 
                         HorizontalDivider(color = NavyBorder)
-                        Text("Parada inicial (opcional)", fontWeight = FontWeight.SemiBold, color = NauticalTeal)
+                        Text("Punto de inicio", fontWeight = FontWeight.SemiBold, color = NauticalTeal)
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { startStopId = null },
+                                .clickable {
+                                    startFromGps = true
+                                    startStopId = null
+                                },
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             RadioButton(
-                                selected = startStopId == null,
-                                onClick = { startStopId = null }
+                                selected = startFromGps,
+                                onClick = {
+                                    startFromGps = true
+                                    startStopId = null
+                                }
                             )
-                            Text("Mantener orden actual", color = TextLight)
+                            Text("Mi ubicación actual (GPS)", color = TextLight)
                         }
 
                         stops.forEachIndexed { idx, stop ->
+                            val isChosenStart = !startFromGps && startStopId == stop.id
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clickable { startStopId = stop.id },
+                                    .clickable {
+                                        startFromGps = false
+                                        startStopId = stop.id
+                                    },
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 RadioButton(
-                                    selected = startStopId == stop.id,
-                                    onClick = { startStopId = stop.id }
+                                    selected = isChosenStart,
+                                    onClick = {
+                                        startFromGps = false
+                                        startStopId = stop.id
+                                    }
                                 )
                                 Text(
                                     text = "#${idx + 1} · ${stop.address}",
@@ -1138,12 +1407,12 @@ private fun RutaScreen(db: AppDatabase) {
                         onClick = {
                             showRouteConfigDialog = false
                             scope.launch {
-                                applyRouteOrder(startStopId, endStopId, keepStreetSequence)
+                                runOptimization(startFromGps, startStopId, endStopId, keepStreetSequence)
                             }
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = NauticalTeal)
                     ) {
-                        Text("Guardar orden", color = Color.White)
+                        Text("Optimizar ahora", color = Color.White)
                     }
                 },
                 dismissButton = {
@@ -1218,20 +1487,21 @@ private fun RutaScreen(db: AppDatabase) {
                                 if (addr.isNotEmpty()) {
                                     scope.launch {
                                         busy = true
+                                        val coords = geocodeAddress(addr)
                                         val newStop = Stop(
                                             id = UUID.randomUUID().toString(),
                                             address = addr,
-                                            latitude = null,
-                                            longitude = null,
+                                            latitude = coords?.latitude,
+                                            longitude = coords?.longitude,
                                             source = "MANUAL",
-                                            verified = false,
+                                            verified = coords != null,
                                             orderIndex = stops.size,
                                             type = manualType
                                         )
                                         db.stopDao().upsert(newStop)
                                         manualAddress = ""
                                         showAddSheet = false
-                                        status = "Parada agregada con enlace a Google Maps"
+                                        status = "Parada agregada"
                                         busy = false
                                     }
                                 }
