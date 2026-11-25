@@ -14,6 +14,7 @@ import android.graphics.SurfaceTexture
 import android.location.Address
 import android.location.Geocoder
 import android.location.LocationManager
+import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
@@ -100,7 +101,7 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-private const val APP_VERSION = "1.6.6"
+private const val APP_VERSION = "1.6.7"
 private const val PREFS_NAME = "ruta_optimizador_prefs"
 private const val KEY_GEMINI_API_KEY = "gemini_api_key"
 private const val DEFAULT_GEMINI_API_KEY = ""
@@ -838,140 +839,203 @@ private fun optimizeStopsRoute(
         }
 }
 
-private suspend fun recognizeTextFromUri(context: Context, uri: Uri): String =
-    withContext(Dispatchers.IO) {
-        val bitmap: Bitmap? = context.contentResolver.openInputStream(uri)?.use { stream ->
-            BitmapFactory.decodeStream(stream)
-        }
-        if (bitmap == null) return@withContext ""
+private suspend fun recognizeTextFromBitmap(bitmap: Bitmap): String {
+    val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    val inputImage = InputImage.fromBitmap(bitmap, 0)
 
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-        val inputImage = InputImage.fromBitmap(bitmap, 0)
+    return suspendCancellableCoroutine { cont ->
+        recognizer.process(inputImage)
+            .addOnSuccessListener { visionText ->
+                recognizer.close()
+                if (!cont.isActive) return@addOnSuccessListener
 
-        suspendCancellableCoroutine { cont ->
-            recognizer.process(inputImage)
-                .addOnSuccessListener { visionText ->
-                    recognizer.close()
-                    if (!cont.isActive) return@addOnSuccessListener
-
-                    val lineBoxes = mutableListOf<OcrLineBox>()
-                    for (block in visionText.textBlocks) {
-                        for (line in block.lines) {
-                            val box = line.boundingBox
-                            val clean = line.text.trim()
-                            if (box != null && clean.isNotBlank()) {
-                                lineBoxes.add(
-                                    OcrLineBox(
-                                        text = clean,
-                                        left = box.left,
-                                        top = box.top,
-                                        right = box.right,
-                                        bottom = box.bottom
-                                    )
-                                )
-                            }
-                        }
-                    }
-
-                    if (lineBoxes.isEmpty()) {
-                        cont.resume(visionText.text)
-                        return@addOnSuccessListener
-                    }
-
-                    val sortedByTop = lineBoxes.sortedWith(
-                        compareBy<OcrLineBox> { it.top }.thenBy { it.left }
-                    )
-                    val mergedRows = mutableListOf<List<OcrLineBox>>()
-                    for (item in sortedByTop) {
-                        val lastRow = mergedRows.lastOrNull()
-                        if (lastRow != null) {
-                            val avgHeight = lastRow.map { it.height }.average()
-                            val avgCenterY = lastRow.map { it.centerY }.average()
-                            if (abs(item.centerY - avgCenterY) <= avgHeight * 0.55) {
-                                mergedRows[mergedRows.lastIndex] = (lastRow + item).sortedBy { it.left }
-                                continue
-                            }
-                        }
-                        mergedRows.add(listOf(item))
-                    }
-
-                    val imageWidth = bitmap.width.coerceAtLeast(1)
-                    val leftNumberRegex = Regex("""^\d{1,3}$""")
-                    val tenDigitGuideRegex = Regex("""\b\d{10}\b(?:\s+\d+/\d+)?""")
-
-                    val cards = mutableListOf<DetectedCardBox>()
-                    var pendingLines = mutableListOf<String>()
-                    var pendingTop: Int? = null
-                    var pendingBottom: Int = 0
-
-                    for (row in mergedRows) {
-                        val leftMost = row.first()
-                        val hasLeftStopNumber = leftMost.left < imageWidth * 0.25f &&
-                            leftNumberRegex.matches(leftMost.text)
-
-                        val contentText = row.filterNot {
-                            it.left < imageWidth * 0.22f && leftNumberRegex.matches(it.text)
-                        }.joinToString(" ") { it.text }.trim()
-
-                        if (contentText.isBlank()) continue
-
-                        val rowTop = row.minOf { it.top }
-                        val rowBottom = row.maxOf { it.bottom }
-
-                        if (hasLeftStopNumber && pendingLines.isNotEmpty()) {
-                            cards.add(
-                                DetectedCardBox(
-                                    top = pendingTop ?: rowTop,
-                                    bottom = pendingBottom.coerceAtLeast(rowTop),
-                                    lines = pendingLines.toList()
+                val lineBoxes = mutableListOf<OcrLineBox>()
+                for (block in visionText.textBlocks) {
+                    for (line in block.lines) {
+                        val box = line.boundingBox
+                        val clean = line.text.trim()
+                        if (box != null && clean.isNotBlank()) {
+                            lineBoxes.add(
+                                OcrLineBox(
+                                    text = clean,
+                                    left = box.left,
+                                    top = box.top,
+                                    right = box.right,
+                                    bottom = box.bottom
                                 )
                             )
-                            pendingLines = mutableListOf()
-                            pendingTop = null
-                            pendingBottom = 0
-                        }
-
-                        if (pendingTop == null) {
-                            pendingTop = rowTop
-                        }
-                        pendingBottom = maxOf(pendingBottom, rowBottom)
-                        pendingLines.add(contentText)
-
-                        if (tenDigitGuideRegex.containsMatchIn(contentText)) {
-                            cards.add(
-                                DetectedCardBox(
-                                    top = pendingTop ?: rowTop,
-                                    bottom = pendingBottom,
-                                    lines = pendingLines.toList()
-                                )
-                            )
-                            pendingLines = mutableListOf()
-                            pendingTop = null
-                            pendingBottom = 0
                         }
                     }
+                }
 
-                    if (pendingLines.isNotEmpty()) {
+                if (lineBoxes.isEmpty()) {
+                    cont.resume(visionText.text)
+                    return@addOnSuccessListener
+                }
+
+                val sortedByTop = lineBoxes.sortedWith(
+                    compareBy<OcrLineBox> { it.top }.thenBy { it.left }
+                )
+                val mergedRows = mutableListOf<List<OcrLineBox>>()
+                for (item in sortedByTop) {
+                    val lastRow = mergedRows.lastOrNull()
+                    if (lastRow != null) {
+                        val avgHeight = lastRow.map { it.height }.average()
+                        val avgCenterY = lastRow.map { it.centerY }.average()
+                        if (abs(item.centerY - avgCenterY) <= avgHeight * 0.55) {
+                            mergedRows[mergedRows.lastIndex] = (lastRow + item).sortedBy { it.left }
+                            continue
+                        }
+                    }
+                    mergedRows.add(listOf(item))
+                }
+
+                val imageWidth = bitmap.width.coerceAtLeast(1)
+                val leftNumberRegex = Regex("""^\d{1,3}$""")
+                val tenDigitGuideRegex = Regex("""\b\d{10}\b(?:\s+\d+/\d+)?""")
+
+                val cards = mutableListOf<DetectedCardBox>()
+                var pendingLines = mutableListOf<String>()
+                var pendingTop: Int? = null
+                var pendingBottom: Int = 0
+
+                for (row in mergedRows) {
+                    val leftMost = row.first()
+                    val hasLeftStopNumber = leftMost.left < imageWidth * 0.25f &&
+                        leftNumberRegex.matches(leftMost.text)
+
+                    val contentText = row.filterNot {
+                        it.left < imageWidth * 0.22f && leftNumberRegex.matches(it.text)
+                    }.joinToString(" ") { it.text }.trim()
+
+                    if (contentText.isBlank()) continue
+
+                    val rowTop = row.minOf { it.top }
+                    val rowBottom = row.maxOf { it.bottom }
+
+                    if (hasLeftStopNumber && pendingLines.isNotEmpty()) {
                         cards.add(
                             DetectedCardBox(
-                                top = pendingTop ?: 0,
+                                top = pendingTop ?: rowTop,
+                                bottom = pendingBottom.coerceAtLeast(rowTop),
+                                lines = pendingLines.toList()
+                            )
+                        )
+                        pendingLines = mutableListOf()
+                        pendingTop = null
+                        pendingBottom = 0
+                    }
+
+                    if (pendingTop == null) {
+                        pendingTop = rowTop
+                    }
+                    pendingBottom = maxOf(pendingBottom, rowBottom)
+                    pendingLines.add(contentText)
+
+                    if (tenDigitGuideRegex.containsMatchIn(contentText)) {
+                        cards.add(
+                            DetectedCardBox(
+                                top = pendingTop ?: rowTop,
                                 bottom = pendingBottom,
                                 lines = pendingLines.toList()
                             )
                         )
+                        pendingLines = mutableListOf()
+                        pendingTop = null
+                        pendingBottom = 0
                     }
+                }
 
-                    val structuredText = cards.joinToString("\n---CARD---\n") { card ->
-                        card.lines.joinToString("\n")
-                    }
-                    cont.resume(structuredText)
+                if (pendingLines.isNotEmpty()) {
+                    cards.add(
+                        DetectedCardBox(
+                            top = pendingTop ?: 0,
+                            bottom = pendingBottom,
+                            lines = pendingLines.toList()
+                        )
+                    )
                 }
-                .addOnFailureListener {
-                    recognizer.close()
-                    if (cont.isActive) cont.resume("")
+
+                val structuredText = cards.joinToString("\n---CARD---\n") { card ->
+                    card.lines.joinToString("\n")
                 }
-        }
+                cont.resume(structuredText)
+            }
+            .addOnFailureListener {
+                recognizer.close()
+                if (cont.isActive) cont.resume("")
+            }
     }
+}
+
+private fun isVideoUri(context: Context, uri: Uri): Boolean {
+    val mime = context.contentResolver.getType(uri).orEmpty()
+    if (mime.startsWith("video/", ignoreCase = true)) return true
+    val path = uri.toString().lowercase(Locale.ROOT)
+    return path.endsWith(".mp4") || path.endsWith(".mov") || path.endsWith(".mkv") || path.endsWith(".avi") || path.endsWith(".3gp")
+}
+
+private suspend fun extractOcrTextsFromMediaUri(context: Context, uri: Uri): List<String> =
+    withContext(Dispatchers.IO) {
+        if (!isVideoUri(context, uri)) {
+            val bitmap = context.contentResolver.openInputStream(uri)?.use { stream ->
+                BitmapFactory.decodeStream(stream)
+            } ?: return@withContext emptyList()
+            val text = recognizeTextFromBitmap(bitmap)
+            bitmap.recycle()
+            return@withContext if (text.isNotBlank()) listOf(text) else emptyList()
+        }
+
+        val retriever = MediaMetadataRetriever()
+        val results = mutableListOf<String>()
+        try {
+            retriever.setDataSource(context, uri)
+            val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull()
+                ?.coerceAtLeast(1000L)
+                ?: 5000L
+
+            val stepMs = 700L
+            val maxFrames = 35
+            val timestamps = mutableListOf<Long>()
+            var pos = 0L
+            while (pos <= durationMs && timestamps.size < maxFrames) {
+                timestamps.add(pos * 1000L)
+                pos += stepMs
+            }
+            if (timestamps.isEmpty()) timestamps.add(0L)
+
+            for (timeUs in timestamps) {
+                val frame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                if (frame != null) {
+                    val text = recognizeTextFromBitmap(frame)
+                    frame.recycle()
+                    if (text.isNotBlank()) {
+                        results.add(text)
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        } finally {
+            try {
+                retriever.release()
+            } catch (_: Exception) {
+            }
+        }
+        results
+    }
+
+private fun normalizeStopSignature(address: String): String {
+    return java.text.Normalizer.normalize(
+        address.lowercase(Locale("es", "MX")),
+        java.text.Normalizer.Form.NFD
+    )
+        .replace(Regex("\\p{InCombiningDiacriticalMarks}+"), "")
+        .replace(Regex("[^a-z0-9 ]"), " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+}
 
 @Composable
 private fun SummaryStatCard(
@@ -1095,7 +1159,7 @@ private fun RutaScreen(db: AppDatabase) {
     var geminiKeyInput by remember { mutableStateOf(geminiApiKey) }
     var showGeminiKeyDialog by remember { mutableStateOf(false) }
 
-    var status by remember { mutableStateOf("Listo para cargar capturas de ruta") }
+    var status by remember { mutableStateOf("Listo para cargar fotos o videos de ruta") }
     var busy by remember { mutableStateOf(false) }
     var manualAddress by remember { mutableStateOf("") }
     var manualType by remember { mutableStateOf("ENTREGA") }
@@ -1378,7 +1442,7 @@ private fun RutaScreen(db: AppDatabase) {
                     db.stopDao().upsertAll(reordered)
                     status = "Orden lógico aplicado con Gemini (${reordered.size} paradas)"
                 } else {
-                    status = "No se aplicó cambio: respuesta incompleta (${reordered.size}/${ordered.size})"
+                    status = "No se aplicó cambio: respuesta incompleta (${reordered.size}/${reordered.size})"
                 }
             }.onFailure { err ->
                 status = "Error Gemini: ${err.message ?: "sin conexión"}"
@@ -1387,49 +1451,62 @@ private fun RutaScreen(db: AppDatabase) {
         }
     }
 
-    fun processScreenshotUris(uris: List<Uri>) {
+    fun processMediaUris(uris: List<Uri>) {
         if (uris.isEmpty()) return
         scope.launch {
             busy = true
-            status = "Leyendo ${uris.size} captura(s) con OCR..."
+            status = "Analizando ${uris.size} archivo(s) de foto/video con OCR..."
             var addedCount = 0
             var nextIndex = stops.size
+            val seenSignatures = stops.map { normalizeStopSignature(it.address) }.toMutableSet()
 
             for (uri in uris) {
-                val rawText = recognizeTextFromUri(context, uri)
-                val extracted = AddressExtractor.candidates(rawText)
-                for (candidate in extracted) {
-                    val coords = geocodeAddress(candidate.address)
-                    val stopToSave = candidate.copy(
-                        latitude = coords?.latitude,
-                        longitude = coords?.longitude,
-                        verified = coords != null,
-                        orderIndex = nextIndex++
-                    )
-                    db.stopDao().upsert(stopToSave)
-                    addedCount++
+                val isVid = isVideoUri(context, uri)
+                status = if (isVid) {
+                    "Extrayendo fotogramas y OCR de video..."
+                } else {
+                    "Leyendo captura con OCR..."
+                }
+                val rawTexts = extractOcrTextsFromMediaUri(context, uri)
+                for (rawText in rawTexts) {
+                    val extracted = AddressExtractor.candidates(rawText)
+                    for (candidate in extracted) {
+                        val sig = normalizeStopSignature(candidate.address)
+                        if (sig.isBlank() || sig in seenSignatures) continue
+                        seenSignatures.add(sig)
+
+                        val coords = geocodeAddress(candidate.address)
+                        val stopToSave = candidate.copy(
+                            latitude = coords?.latitude,
+                            longitude = coords?.longitude,
+                            verified = coords != null,
+                            orderIndex = nextIndex++
+                        )
+                        db.stopDao().upsert(stopToSave)
+                        addedCount++
+                    }
                 }
             }
 
             status = if (addedCount > 0) {
-                "Se agregaron $addedCount parada(s) desde capturas"
+                "Se agregaron $addedCount parada(s) desde fotos/videos"
             } else {
-                "No se detectaron direcciones válidas en las capturas"
+                "No se detectaron direcciones nuevas en los archivos"
             }
             busy = false
         }
     }
 
-    val multiPhotoPicker = rememberLauncherForActivityResult(
+    val multiMediaPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickMultipleVisualMedia()
     ) { uris ->
-        processScreenshotUris(uris)
+        processMediaUris(uris)
     }
 
-    val singlePhotoPicker = rememberLauncherForActivityResult(
+    val singleMediaPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
-        uri?.let { processScreenshotUris(listOf(it)) }
+        uri?.let { processMediaUris(listOf(it)) }
     }
 
     fun toggleSelection(stopId: String) {
@@ -1572,12 +1649,12 @@ private fun RutaScreen(db: AppDatabase) {
                         }
                         IconButton(
                             onClick = {
-                                multiPhotoPicker.launch(
-                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                multiMediaPicker.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
                                 )
                             }
                         ) {
-                            Icon(Icons.Default.Image, contentDescription = "Cargar capturas")
+                            Icon(Icons.Default.Image, contentDescription = "Cargar fotos o videos")
                         }
                         IconButton(onClick = { showMap = !showMap }) {
                             Icon(
@@ -1619,12 +1696,12 @@ private fun RutaScreen(db: AppDatabase) {
                                 }
                             )
                             DropdownMenuItem(
-                                text = { Text("Cargar capturas (OCR)", color = TextLight) },
+                                text = { Text("Cargar fotos o videos (OCR)", color = TextLight) },
                                 leadingIcon = { Icon(Icons.Default.Image, contentDescription = null, tint = NauticalTeal) },
                                 onClick = {
                                     menuExpanded = false
-                                    multiPhotoPicker.launch(
-                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                    multiMediaPicker.launch(
+                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
                                     )
                                 }
                             )
@@ -1659,14 +1736,14 @@ private fun RutaScreen(db: AppDatabase) {
                 ) {
                     SmallFloatingActionButton(
                         onClick = {
-                            multiPhotoPicker.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            multiMediaPicker.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
                             )
                         },
                         containerColor = NavyCard,
                         contentColor = NauticalTeal
                     ) {
-                        Icon(Icons.Default.Image, contentDescription = "Capturas OCR")
+                        Icon(Icons.Default.Image, contentDescription = "Fotos o videos OCR")
                     }
                     FloatingActionButton(
                         onClick = { showAddSheet = true },
@@ -1754,8 +1831,8 @@ private fun RutaScreen(db: AppDatabase) {
                     }
                     TextButton(
                         onClick = {
-                            multiPhotoPicker.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            multiMediaPicker.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
                             )
                         }
                     ) {
@@ -2177,15 +2254,15 @@ private fun RutaScreen(db: AppDatabase) {
                         OutlinedButton(
                             onClick = {
                                 showAddSheet = false
-                                singlePhotoPicker.launch(
-                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                singleMediaPicker.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
                                 )
                             },
                             modifier = Modifier.weight(1f)
                         ) {
                             Icon(Icons.Default.Image, contentDescription = null)
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Desde captura")
+                            Text("Foto o video")
                         }
                         Button(
                             onClick = {
