@@ -81,9 +81,14 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -1035,6 +1040,20 @@ private fun normalizeStopSignature(address: String): String {
         .replace(Regex("[^a-z0-9 ]"), " ")
         .replace(Regex("\\s+"), " ")
         .trim()
+}
+
+private fun parseBulkTextAddresses(rawText: String): List<String> {
+    if (rawText.isBlank()) return emptyList()
+    return rawText
+        .replace("\r\n", "\n")
+        .split('\n', ';')
+        .map { line ->
+            line.trim()
+                .replace(Regex("""^\s*(?:[-•*]|\d{1,3}[.)\-])\s+"""), "")
+                .replace(Regex("""\s+"""), " ")
+                .trim()
+        }
+        .filter { it.isNotEmpty() }
 }
 
 @Composable
@@ -2266,25 +2285,43 @@ private fun RutaScreen(db: AppDatabase) {
                         }
                         Button(
                             onClick = {
-                                val addr = manualAddress.trim()
-                                if (addr.isNotEmpty()) {
+                                val parsedList = parseBulkTextAddresses(manualAddress)
+                                if (parsedList.isNotEmpty()) {
                                     scope.launch {
                                         busy = true
-                                        val coords = geocodeAddress(addr)
-                                        val newStop = Stop(
-                                            id = UUID.randomUUID().toString(),
-                                            address = addr,
-                                            latitude = coords?.latitude,
-                                            longitude = coords?.longitude,
-                                            source = "MANUAL",
-                                            verified = coords != null,
-                                            orderIndex = stops.size,
-                                            type = manualType
-                                        )
-                                        db.stopDao().upsert(newStop)
+                                        val totalInput = parsedList.size
+                                        status = "Procesando $totalInput domicilio(s)..."
+                                        val baseOrder = stops.size
+                                        val semaphore = Semaphore(6)
+                                        val builtStops = coroutineScope {
+                                            parsedList.mapIndexed { idx, addr ->
+                                                async {
+                                                    semaphore.withPermit {
+                                                        val coords = geocodeAddress(addr)
+                                                        Stop(
+                                                            id = UUID.randomUUID().toString(),
+                                                            address = addr,
+                                                            latitude = coords?.latitude,
+                                                            longitude = coords?.longitude,
+                                                            source = "MANUAL",
+                                                            verified = coords != null,
+                                                            orderIndex = baseOrder + idx,
+                                                            type = manualType
+                                                        )
+                                                    }
+                                                }
+                                            }.awaitAll()
+                                        }
+                                        builtStops.chunked(50).forEach { chunk ->
+                                            db.stopDao().upsertAll(chunk)
+                                        }
                                         manualAddress = ""
                                         showAddSheet = false
-                                        status = "Parada agregada"
+                                        status = if (builtStops.size == 1) {
+                                            "Parada agregada"
+                                        } else {
+                                            "Se procesaron ${builtStops.size} domicilios"
+                                        }
                                         busy = false
                                     }
                                 }
