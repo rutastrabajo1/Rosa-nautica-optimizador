@@ -274,7 +274,6 @@ private suspend fun orderStopsWithGemini(
             apiKeyHeader = cleanKey
         )
 
-        // Si la clave empieza con AQ. y falla por autenticación en query/x-goog-api-key, reintenta como Bearer token
         if ((code == 400 || code == 401 || code == 403) && cleanKey.startsWith("AQ.")) {
             val retry = executeGeminiPost(
                 urlString = baseUrl,
@@ -313,8 +312,6 @@ private suspend fun orderStopsWithGemini(
         val expectedIds = orderedStops.map { it.id }
         val expectedSet = expectedIds.toSet()
 
-        // Si Gemini devolvió todos los IDs válidos, los aplicamos directo;
-        // si omitió alguno en una lista muy larga, conservamos su orden y añadimos los faltantes al final sin perder paradas.
         val validOrdered = returnedIds.filter { it in expectedSet }
         if (validOrdered.isEmpty()) {
             return@withContext Result.failure(Exception("Gemini no devolvió IDs válidos"))
@@ -717,8 +714,6 @@ private fun optimizeStopsRoute(
         it.id != startStop?.id && it.id != endStop?.id
     }.toMutableList()
 
-    val route = mutableListOf<Stop>()
-
     fun normalize(value: String): String {
         return java.text.Normalizer.normalize(
             value.lowercase(Locale("es", "MX")),
@@ -760,43 +755,78 @@ private fun optimizeStopsRoute(
         return results[0]
     }
 
+    val route = mutableListOf<Stop>()
+    var anchorPoint: LatLng? = null
+
     when {
-        startStop != null -> route.add(startStop)
-        startFromCurrentGps && currentLatLng != null && remaining.isNotEmpty() -> {
-            val withCoords = remaining.filter { it.latitude != null && it.longitude != null }
-            val nearest = withCoords.minByOrNull { stop ->
-                distanceMeters(currentLatLng, LatLng(stop.latitude!!, stop.longitude!!))
-            }
-            if (nearest != null) {
-                remaining.remove(nearest)
-                route.add(nearest)
-            } else {
-                route.add(remaining.removeAt(0))
+        startStop != null -> {
+            route.add(startStop)
+            if (startStop.latitude != null && startStop.longitude != null) {
+                anchorPoint = LatLng(startStop.latitude, startStop.longitude)
             }
         }
-        remaining.isNotEmpty() -> route.add(remaining.removeAt(0))
-    }
-
-    val orderedRemaining = if (respectStreetSequence) {
-        remaining
-            .groupBy { getStreetAndNeighborhood(it).second.ifBlank { "sin-colonia" } }
-            .values
-            .flatMap { coloniaStops ->
-                coloniaStops
-                    .groupBy { getStreetAndNeighborhood(it).first.ifBlank { "sin-calle" } }
-                    .values
-                    .flatMap { streetStops ->
-                        streetStops.sortedWith(
-                            compareBy<Stop> { houseNumber(it) ?: Int.MAX_VALUE }
-                                .thenBy { it.orderIndex }
-                        )
-                    }
+        startFromCurrentGps && currentLatLng != null -> {
+            anchorPoint = currentLatLng
+        }
+        remaining.isNotEmpty() -> {
+            val first = remaining.removeAt(0)
+            route.add(first)
+            if (first.latitude != null && first.longitude != null) {
+                anchorPoint = LatLng(first.latitude, first.longitude)
             }
-    } else {
-        remaining.sortedBy { it.orderIndex }
+        }
     }
 
-    route.addAll(orderedRemaining)
+    if (anchorPoint == null && remaining.isNotEmpty()) {
+        val firstWithCoords = remaining.firstOrNull { it.latitude != null && it.longitude != null }
+        if (firstWithCoords != null) {
+            anchorPoint = LatLng(firstWithCoords.latitude!!, firstWithCoords.longitude!!)
+        }
+    }
+
+    while (remaining.isNotEmpty()) {
+        val currentLoc = anchorPoint
+        val currentKey = route.lastOrNull()?.let { getStreetAndNeighborhood(it) }
+
+        val nextStop = if (currentLoc != null) {
+            remaining.minByOrNull { cand ->
+                val candLoc = if (cand.latitude != null && cand.longitude != null) {
+                    LatLng(cand.latitude, cand.longitude)
+                } else {
+                    null
+                }
+                val rawDist = if (candLoc != null) {
+                    distanceMeters(currentLoc, candLoc).toDouble()
+                } else {
+                    1_000_000.0
+                }
+
+                if (respectStreetSequence && currentKey != null) {
+                    val candKey = getStreetAndNeighborhood(cand)
+                    val sameStreet = currentKey.first.isNotBlank() && currentKey.first == candKey.first
+                    val sameColonia = currentKey.second.isNotBlank() && currentKey.second == candKey.second
+                    val numBonus = (houseNumber(cand) ?: 9999) * 0.05
+
+                    when {
+                        sameStreet && rawDist <= 1200.0 -> rawDist * 0.25 + numBonus
+                        sameColonia && rawDist <= 1500.0 -> rawDist * 0.55 + numBonus
+                        else -> rawDist + numBonus
+                    }
+                } else {
+                    rawDist
+                }
+            } ?: remaining.first()
+        } else {
+            remaining.first()
+        }
+
+        remaining.remove(nextStop)
+        route.add(nextStop)
+
+        if (nextStop.latitude != null && nextStop.longitude != null) {
+            anchorPoint = LatLng(nextStop.latitude, nextStop.longitude)
+        }
+    }
 
     if (endStop != null) {
         route.add(endStop)
