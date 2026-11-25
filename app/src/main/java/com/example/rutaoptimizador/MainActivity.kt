@@ -2226,14 +2226,18 @@ private fun RutaScreen(db: AppDatabase) {
         }
 
         if (showAddSheet) {
+            val addSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
             ModalBottomSheet(
                 onDismissRequest = { showAddSheet = false },
+                sheetState = addSheetState,
                 containerColor = NavyCard,
                 contentColor = TextLight
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .imePadding()
+                        .verticalScroll(rememberScrollState())
                         .padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
@@ -2241,8 +2245,10 @@ private fun RutaScreen(db: AppDatabase) {
                     OutlinedTextField(
                         value = manualAddress,
                         onValueChange = { manualAddress = it },
-                        label = { Text("Dirección", color = TextMutedLight) },
+                        label = { Text("Dirección(es) - 1 por línea", color = TextMutedLight) },
                         singleLine = false,
+                        minLines = 3,
+                        maxLines = 6,
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedTextColor = TextLight,
