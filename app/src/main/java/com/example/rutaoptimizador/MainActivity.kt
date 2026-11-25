@@ -659,20 +659,6 @@ private fun haversineMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Doub
     return r * c
 }
 
-private fun streetClusterKey(stop: Stop): String {
-    val parts = stop.address.split(",")
-        .map { part ->
-            part.lowercase(Locale("es", "MX"))
-                .replace(Regex("""\b\d+\b"""), "")
-                .replace(Regex("""\s+"""), " ")
-                .trim()
-        }
-        .filter { it.isNotBlank() }
-    val street = parts.firstOrNull().orEmpty()
-    val colonia = parts.getOrNull(1).orEmpty()
-    return if (street.isNotBlank() || colonia.isNotBlank()) "$street|$colonia" else stop.id
-}
-
 private fun optimizeStopsRoute(
     stopsWithCoords: List<Stop>,
     startFromCurrentGps: Boolean,
@@ -681,91 +667,119 @@ private fun optimizeStopsRoute(
     fixedEndId: String?,
     respectStreetSequence: Boolean = true
 ): List<Stop> {
-    if (stopsWithCoords.size <= 1) return stopsWithCoords
+    if (stopsWithCoords.size <= 1) {
+        return stopsWithCoords.mapIndexed { index, stop ->
+            stop.copy(orderIndex = index)
+        }
+    }
 
     val orderedInput = stopsWithCoords.sortedBy { it.orderIndex }
-    val endStop = fixedEndId?.let { id -> orderedInput.firstOrNull { it.id == id } }
+
+    val endStop = fixedEndId?.let { id ->
+        orderedInput.firstOrNull { it.id == id }
+    }
+
     val startStop = if (!startFromCurrentGps) {
         fixedStartId?.let { id ->
             orderedInput.firstOrNull { it.id == id && it.id != endStop?.id }
         }
-    } else null
+    } else {
+        null
+    }
 
-    val middlePool = orderedInput.filter {
+    val remaining = orderedInput.filter {
         it.id != startStop?.id && it.id != endStop?.id
     }.toMutableList()
 
     val route = mutableListOf<Stop>()
-    var anchorLat: Double
-    var anchorLng: Double
 
-    if (startFromCurrentGps && currentLatLng != null) {
-        anchorLat = currentLatLng.latitude
-        anchorLng = currentLatLng.longitude
-    } else if (startStop != null) {
-        route.add(startStop)
-        anchorLat = startStop.latitude!!
-        anchorLng = startStop.longitude!!
+    fun normalize(value: String): String {
+        return java.text.Normalizer.normalize(
+            value.lowercase(Locale("es", "MX")),
+            java.text.Normalizer.Form.NFD
+        )
+            .replace(Regex("\\p{InCombiningDiacriticalMarks}+"), "")
+            .replace(Regex("[^a-z0-9 ]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    fun getStreetAndNeighborhood(stop: Stop): Pair<String, String> {
+        val parts = stop.address.split(",")
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+
+        val street = parts.getOrNull(0)?.let(::normalize).orEmpty()
+        val neighborhood = parts.getOrNull(1)?.let(::normalize).orEmpty()
+        return street to neighborhood
+    }
+
+    fun houseNumber(stop: Stop): Int? {
+        val firstPart = stop.address.split(",").firstOrNull().orEmpty()
+        return Regex("""\b\d+[A-Za-z]?\b""")
+            .findAll(firstPart)
+            .lastOrNull()
+            ?.value
+            ?.filter { it.isDigit() }
+            ?.toIntOrNull()
+    }
+
+    fun distanceMeters(a: LatLng, b: LatLng): Float {
+        val results = FloatArray(1)
+        android.location.Location.distanceBetween(
+            a.latitude, a.longitude,
+            b.latitude, b.longitude,
+            results
+        )
+        return results[0]
+    }
+
+    when {
+        startStop != null -> route.add(startStop)
+        startFromCurrentGps && currentLatLng != null && remaining.isNotEmpty() -> {
+            val withCoords = remaining.filter { it.latitude != null && it.longitude != null }
+            val nearest = withCoords.minByOrNull { stop ->
+                distanceMeters(currentLatLng, LatLng(stop.latitude!!, stop.longitude!!))
+            }
+            if (nearest != null) {
+                remaining.remove(nearest)
+                route.add(nearest)
+            } else {
+                route.add(remaining.removeAt(0))
+            }
+        }
+        remaining.isNotEmpty() -> route.add(remaining.removeAt(0))
+    }
+
+    val orderedRemaining = if (respectStreetSequence) {
+        remaining
+            .groupBy { getStreetAndNeighborhood(it).second.ifBlank { "sin-colonia" } }
+            .values
+            .flatMap { coloniaStops ->
+                coloniaStops
+                    .groupBy { getStreetAndNeighborhood(it).first.ifBlank { "sin-calle" } }
+                    .values
+                    .flatMap { streetStops ->
+                        streetStops.sortedWith(
+                            compareBy<Stop> { houseNumber(it) ?: Int.MAX_VALUE }
+                                .thenBy { it.orderIndex }
+                        )
+                    }
+            }
     } else {
-        val first = middlePool.removeAt(0)
-        route.add(first)
-        anchorLat = first.latitude!!
-        anchorLng = first.longitude!!
+        remaining.sortedBy { it.orderIndex }
     }
 
-    if (respectStreetSequence) {
-        val remaining = middlePool.toMutableList()
-        while (remaining.isNotEmpty()) {
-            val current = remaining.removeAt(0)
-            route.add(current)
-
-            val nearbySameClusterIndices = mutableListOf<Int>()
-            for (i in remaining.indices) {
-                val cand = remaining[i]
-                val dist = haversineMeters(
-                    current.latitude!!,
-                    current.longitude!!,
-                    cand.latitude!!,
-                    cand.longitude!!
-                )
-                if (dist <= 220.0 && streetClusterKey(cand) == streetClusterKey(current)) {
-                    nearbySameClusterIndices.add(i)
-                }
-            }
-
-            for (idx in nearbySameClusterIndices.reversed()) {
-                val grouped = remaining.removeAt(idx)
-                route.add(grouped)
-            }
-        }
-        if (endStop != null) {
-            route.add(endStop)
-        }
-        return route.mapIndexed { idx, stop -> stop.copy(orderIndex = idx) }
-    }
-
-    while (middlePool.isNotEmpty()) {
-        val nextIdx = middlePool.indices.minByOrNull { i ->
-            val candidate = middlePool[i]
-            haversineMeters(
-                anchorLat,
-                anchorLng,
-                candidate.latitude!!,
-                candidate.longitude!!
-            )
-        } ?: 0
-
-        val chosen = middlePool.removeAt(nextIdx)
-        route.add(chosen)
-        anchorLat = chosen.latitude!!
-        anchorLng = chosen.longitude!!
-    }
+    route.addAll(orderedRemaining)
 
     if (endStop != null) {
         route.add(endStop)
     }
 
-    return route.mapIndexed { idx, stop -> stop.copy(orderIndex = idx) }
+    return route.distinctBy { it.id }
+        .mapIndexed { index, stop ->
+            stop.copy(orderIndex = index)
+        }
 }
 
 private suspend fun recognizeTextFromUri(context: Context, uri: Uri): String =
