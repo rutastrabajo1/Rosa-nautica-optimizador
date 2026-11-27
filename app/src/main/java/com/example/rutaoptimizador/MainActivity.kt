@@ -1393,10 +1393,49 @@ private fun RutaScreen(db: AppDatabase) {
         endId: String?,
         respectSequence: Boolean
     ) {
+        if (busy) return
+
         busy = true
-        val gps = getLastKnownLatLng()
-        val withCoords = stops.filter { it.latitude != null && it.longitude != null }
-        if (withCoords.isNotEmpty()) {
+
+        try {
+            val originalStops = stops.sortedBy { it.orderIndex }
+
+            if (originalStops.isEmpty()) {
+                status = "No hay paradas para optimizar"
+                return
+            }
+
+            val gps = if (fromGps) getLastKnownLatLng() else null
+
+            if (fromGps && gps == null) {
+                status = "No se pudo obtener tu ubicación GPS. Verifica los permisos."
+                return
+            }
+
+            val withCoords = originalStops.filter {
+                it.latitude != null && it.longitude != null
+            }
+
+            if (withCoords.isEmpty()) {
+                status = "No hay paradas con coordenadas GPS para optimizar"
+                return
+            }
+
+            if (startId != null && withCoords.none { it.id == startId }) {
+                status = "La parada inicial seleccionada no tiene coordenadas GPS"
+                return
+            }
+
+            if (endId != null && withCoords.none { it.id == endId }) {
+                status = "La parada final seleccionada no tiene coordenadas GPS"
+                return
+            }
+
+            if (startId != null && startId == endId && withCoords.size > 1) {
+                status = "El inicio y el final no pueden ser la misma parada"
+                return
+            }
+
             val optimized = optimizeStopsRoute(
                 stopsWithCoords = withCoords,
                 startFromCurrentGps = fromGps,
@@ -1405,27 +1444,56 @@ private fun RutaScreen(db: AppDatabase) {
                 fixedEndId = endId,
                 respectStreetSequence = respectSequence
             )
-            val withoutCoords = stops.filter { it.latitude == null || it.longitude == null }
-                .sortedBy { it.orderIndex }
-            val merged = (optimized + withoutCoords).mapIndexed { idx, s -> s.copy(orderIndex = idx) }
+
+            // Comprobar que el optimizador no haya perdido ni duplicado paradas.
+            val originalIds = withCoords.map { it.id }.toSet()
+            val optimizedIds = optimized.map { it.id }.toSet()
+
+            if (
+                optimized.size != withCoords.size ||
+                optimizedIds != originalIds
+            ) {
+                status = "No se aplicó la ruta: el optimizador devolvió paradas incorrectas"
+                return
+            }
+
+            // Mantener las paradas sin coordenadas al final,
+            // respetando su orden original.
+            val withoutCoords = originalStops.filter {
+                it.latitude == null || it.longitude == null
+            }
+
+            val merged = (optimized + withoutCoords).mapIndexed { index, stop ->
+                stop.copy(orderIndex = index)
+            }
+
             db.stopDao().upsertAll(merged)
+
             val originLabel = when {
-                fromGps && gps != null -> "desde GPS"
-                startId != null -> {
-                    val idx = stops.indexOfFirst { it.id == startId }
-                    if (idx >= 0) "desde #${idx + 1}" else "optimizada"
+                fromGps -> "desde GPS"
+                startId != null -> "desde parada seleccionada"
+                else -> "sin inicio fijo"
+            }
+
+            status = buildString {
+                append("Ruta reorganizada $originLabel")
+                append(" · ${optimized.size} paradas con GPS")
+                if (withoutCoords.isNotEmpty()) {
+                    append(" · ${withoutCoords.size} sin coordenadas al final")
                 }
-                else -> "optimizada"
+                if (respectSequence) {
+                    append(" · secuencia de calles activada")
+                }
+                if (endId != null) {
+                    append(" · destino final respetado")
+                }
             }
-            status = if (respectSequence) {
-                "Secuencia conservada y agrupada $originLabel (${optimized.size} con GPS)"
-            } else {
-                "Ruta optimizada por cercanía $originLabel (${optimized.size} con GPS)"
-            }
-        } else {
-            status = "Sin coordenadas para optimizar"
+
+        } catch (e: Exception) {
+            status = "Error al optimizar la ruta: ${e.message ?: "error desconocido"}"
+        } finally {
+            busy = false
         }
-        busy = false
     }
 
     fun runGeminiLogicalOrder() {
